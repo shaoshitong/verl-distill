@@ -109,6 +109,23 @@ Expected layout:
 ```text
 zimage_merged_notext_turbogen_lance/
 ode_pairs/zimage_turbo_cfg0_buckets_seq1024_lance4_text6_full_qwen_scored/
+ode_pair_archives/zimage_turbo_cfg0_buckets_seq1024_lance4_text6_full_qwen_scored/
+```
+
+The Lance directory is uploaded directly. The ODE warmup pairs are also exposed
+as archive shards under `ode_pair_archives/` to avoid pushing tens of thousands
+of small files through the Hub. Reconstruct the local ODE pair directory with:
+
+```bash
+ARCHIVE_DIR=/path/to/ode_pair_archives/zimage_turbo_cfg0_buckets_seq1024_lance4_text6_full_qwen_scored
+ODE_DIR=/path/to/ode_pairs/zimage_turbo_cfg0_buckets_seq1024_lance4_text6_full_qwen_scored
+
+mkdir -p "$ODE_DIR"
+cd "$ODE_DIR"
+
+cat "$ARCHIVE_DIR"/images.tar.part-* | tar -xf -
+cat "$ARCHIVE_DIR"/latents.tar.part-* | tar -xf -
+cat "$ARCHIVE_DIR"/noise.tar.part-* | tar -xf -
 ```
 
 ## Other Recipes
