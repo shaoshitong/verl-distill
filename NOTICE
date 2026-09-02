@@ -1,0 +1,9 @@
+verl-distill
+Copyright 2026 verl-distill contributors
+
+The initial algorithm implementation was reorganized from a private research
+codebase. Private infrastructure, experiment identifiers, and repository history
+are not included in this distribution.
+
+No vendored third-party projects, model weights, datasets, generated samples, or
+training checkpoints are included in this distribution.

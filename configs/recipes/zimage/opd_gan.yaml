@@ -1,0 +1,51 @@
+defaults:
+  - ../../base/zimage.yaml
+  - ../../methods/opd_gan.yaml
+
+data:
+  format: prompt_jsonl
+  manifest: ${oc.env:TRAIN_MANIFEST}
+  prompt_key: refined_prompt
+  resolution: 1024
+
+optimizer:
+  generator:
+    lr: 5.0e-6
+    betas: [0.9, 0.999]
+    weight_decay: 0.0
+    max_grad_norm: 5.0
+    lr_scheduler: cosine
+    lr_decay_steps: 3000
+    lr_min: 1.0e-6
+  discriminator:
+    lr: 5.0e-6
+    betas: [0.9, 0.999]
+    weight_decay: 0.0
+    max_grad_norm: 5.0
+
+runtime:
+  gradient_accumulation_steps: 4
+  micro_batch_size: 1
+  max_train_steps: 1001
+  gradient_checkpointing: true
+  save_optimizer_state: true
+  debug_every_n_steps: 50
+  debug_cfg_scale: 0.0
+  debug_seed: 42
+  debug_prompts: ["a photo of a bench", "a photo of a cow"]
+
+ema:
+  enabled: true
+  decay: 0.99
+
+discriminator:
+  pretrained_checkpoint: ${oc.env:DISCRIMINATOR_CHECKPOINT}
+  frozen_checkpoint: ${oc.env:FROZEN_DISCRIMINATOR_CHECKPOINT}
+  multifeature_layers: [4, 12, 20]
+  multifeature_fusion: channel
+  multifeature_norm: new
+  transformer_layers: 5
+  transformer_heads: 8
+  mlp_ratio: 4.0
+  output_dim: 4096
+  use_time_embedding: true

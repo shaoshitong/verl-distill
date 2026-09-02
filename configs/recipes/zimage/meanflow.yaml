@@ -1,0 +1,32 @@
+defaults:
+  - ../../base/zimage.yaml
+  - ../../methods/meanflow.yaml
+
+data:
+  image_root: ${oc.env:TRAIN_IMAGE_ROOT}
+  image_key: image
+  center_crop: true
+  random_flip: false
+
+optimizer:
+  generator:
+    lr: 1.0e-4
+    betas: [0.9, 0.999]
+    weight_decay: 1.0e-2
+    max_grad_norm: 10.0
+
+runtime:
+  micro_batch_size: 1
+  gradient_accumulation_steps: 4
+  max_train_steps: 0
+  num_workers: 4
+  gradient_checkpointing: true
+  save_every_n_steps: 1000
+  debug_every_n_steps: 100
+  debug_cfg_scale: 1.5
+  debug_seed: 42
+  debug_prompts: ["a photo of a bench", "a photo of a beautiful chinese girl"]
+
+ema:
+  enabled: true
+  decay: 0.99

@@ -1,0 +1,29 @@
+method:
+  name: meanflow
+  params:
+    loss_mode: finite_difference
+    align_type: split_fd_fm_terminal_anchor_v3
+    fd_delta: 0.005
+    teacher_cfg_scale: 2.5
+    flow_shift: 3.0
+    rt_sampler: gap_curriculum_split_nodiag
+    rt_curriculum_steps: 50000
+    gap_min: 1.0e-4
+    gap_max_start: 0.10
+    gap_max_end: 0.3
+    split_gap_min: 1.0e-4
+    split_gap_max_start: 0.10
+    split_gap_max_end: 1.0
+    split_alpha_min: 0.2
+    split_alpha_max: 0.8
+    two_res_lambda_t: 1.0
+    two_res_lambda_s: 1.0
+    fm_lambda: 1.0
+    split_fd_terminal_cfg_scale_start: -0.5
+    split_fd_terminal_cfg_scale_end: 0.5
+    split_fd_terminal_cfg_scale_steps: 1500
+    two_res_gamma_weight_max: 500.0
+    sampling_steps: 4
+    transport_type: Linear
+    rt_discrete_grid: false
+    loss_reduction: sum

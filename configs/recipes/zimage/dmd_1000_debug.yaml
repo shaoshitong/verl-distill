@@ -1,0 +1,8 @@
+defaults:
+  - dmd.yaml
+
+runtime:
+  max_train_steps: ${oc.env:MAX_TRAIN_STEPS,1000}
+  save_every_n_steps: ${oc.env:SAVE_EVERY_N_STEPS,1000}
+  debug_every_n_steps: ${oc.env:DEBUG_EVERY_N_STEPS,50}
+  output_dir: ${oc.env:OUTPUT_DIR,outputs/dmd_1000_debug}

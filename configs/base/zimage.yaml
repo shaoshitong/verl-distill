@@ -1,0 +1,18 @@
+model:
+  pretrained_model: ${oc.env:ZIMAGE_MODEL_PATH}
+  teacher_model: ${oc.env:ZIMAGE_TEACHER_MODEL_PATH,}
+
+data:
+  format: image_jsonl
+  manifest: ${oc.env:TRAIN_MANIFEST,}
+  prompt_key: refined_prompt
+  resolution: 1024
+
+runtime:
+  seed: 42
+  output_dir: ${oc.env:OUTPUT_DIR,outputs}
+  resume_from: ${oc.env:RESUME_FROM,}
+  gradient_accumulation_steps: 1
+
+distributed:
+  backend: nccl

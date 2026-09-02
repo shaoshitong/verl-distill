@@ -1,0 +1,23 @@
+method:
+  name: dmd_full
+  params:
+    transport_type: Linear
+    num_train_timestep: 1000
+    min_step_percent: 0.02
+    max_step_percent: 0.98
+    num_denoising_step: 4
+    timestep_shift: 5.0
+    backward_simulation: false
+    backward_simulation_mode: uncorrelated
+    real_guidance_scale: 5.5
+    fake_guidance_scale: 0.0
+    fake_score_use_generator_timestep: true
+    dfake_gen_update_ratio: 5
+    dm_loss_weight: 1.0
+    loss_type: mse
+    gt_grad_loss_weight: 0.0
+    grad_norm_eps: 1.0e-6
+    score_loss_weight: 1.0
+    score_use_weighting: false
+    score_loss_target: x0
+    sampling_steps: 4

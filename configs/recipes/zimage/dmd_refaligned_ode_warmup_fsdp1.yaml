@@ -1,0 +1,80 @@
+defaults:
+  - dmd.yaml
+
+model:
+  fake_score_aux_time_embed: false
+  fake_score_model: ${oc.env:ZIMAGE_FAKE_SCORE_MODEL_PATH,}
+
+data:
+  format: image_lance
+  lance_data_dir: ${oc.env:TRAIN_LANCE_DATA_DIR}
+  resolution: 1024
+  center_crop: true
+  random_flip: false
+  aspect_buckets:
+    - [1024, 1024]
+    - [832, 1408]
+    - [1408, 832]
+
+method:
+  params:
+    timestep_shift: 1.0
+    fake_score_use_generator_timestep: false
+    warmup_type: ode_pair
+    warmup_iterations: 1000
+    ode_warmup_loss_weight: 1.0
+    ode_warmup_pair_dir: ${oc.env:ZIMAGE_ODE_PAIR_DIR,}
+    ode_warmup_generator_sigma_probs: [0.8, 0.16, 0.032, 0.008]
+    ode_warmup_reward_weighting: source_rank
+    ode_warmup_rank_weight_strength: 1.0
+    ode_warmup_reward_weights:
+      lance:
+        aesthetic: 0.45
+        color_harmony: 0.40
+        instruction_following: 0.10
+        score: 0.05
+      text_render:
+        instruction_following: 0.75
+        aesthetic: 0.10
+        color_harmony: 0.10
+        score: 0.05
+
+optimizer:
+  generator:
+    lr: 1.0e-5
+    warmup_lr: 1.0e-4
+    betas: [0.0, 0.999]
+    warmup_betas: [0.9, 0.999]
+    weight_decay: 1.0e-2
+    max_grad_norm: 1.0
+    lr_scheduler: none
+  fake_score:
+    lr: 1.0e-5
+    warmup_lr: 0.0
+    betas: [0.9, 0.999]
+    warmup_betas: [0.9, 0.999]
+    weight_decay: 0.0
+    max_grad_norm: 1.0
+    lr_scheduler: none
+
+runtime:
+  max_train_steps: 50000
+  micro_batch_size: 1
+  gradient_accumulation_steps: 4
+  num_workers: 4
+  save_every_n_steps: 1000
+  debug_every_n_steps: 100
+  debug_timestep_shift: 1.0
+  debug_height: 1024
+  debug_width: 1024
+  debug_return_traj: true
+  debug_prompts:
+    - a photo of a bench
+    - a photo of a beautiful chinese girl
+  param_probe_every_n_steps: 50
+
+distributed:
+  fsdp_backend: fsdp1
+  param_dtype: bfloat16
+  reduce_dtype: float32
+  buffer_dtype: float32

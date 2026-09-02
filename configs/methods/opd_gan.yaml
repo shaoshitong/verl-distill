@@ -1,0 +1,35 @@
+method:
+  name: opd_gan
+  params:
+    transport_type: Linear
+    num_train_timestep: 1000
+    num_student_steps: 4
+    teacher_micro_steps: 2
+    timestep_shift: 3.0
+    initial_warmup_step_size: 0.005
+    initial_warmup_rollout: 1
+    loss_weight: 1.0
+    grad_norm_eps: 1.0e-6
+    sampling_steps: 4
+    discriminator_update_ratio: 3
+    discriminator_t_min: 0.02
+    discriminator_t_max: 0.98
+    discriminator_loss_weight: 1.0
+    generator_loss_weight: 1.0
+    rollout_mode: trajectory_bernoulli
+    loss_mode: dual_distilled_early_exit_xt
+    exit_step_mode: random
+    exit_point_choices: [4, 3, 2, 1]
+    exit_point_weights: [1.0, 1.0, 1.0, 1.0]
+    rollout_stochast_ratio: 1.0
+    dual_align_loss_weight: 1.0
+    dual_align_mse_weight: 0.5
+    dual_align_pearson_eps: 1.0e-6
+    dual_align_pearson_mode: channel
+    dual_frozen_discriminator_t: 0.005
+    generator_adv_loss_max: 1.0
+    apt_r1_weight: 0.0
+    apt_r2_weight: 0.0
+    feature_matching_weight: 0.0
+    perception_loss_weight: 0.0
+    pf_vjp_loss_weight: 0.0
