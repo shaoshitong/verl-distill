@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import logging
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 import torch.distributed as dist
@@ -12,6 +12,7 @@ from PIL import Image
 from verl_distill.algorithms import build_algorithm
 from verl_distill.data import build_dataloader, build_dataset
 from verl_distill.engine.checkpoint import (
+    load_distributed_model_state,
     load_distributed_training_state,
     load_training_state,
     save_distributed_training_state,
@@ -22,6 +23,7 @@ from verl_distill.engine.fsdp1 import apply_zimage_fsdp1
 from verl_distill.engine.fsdp2 import apply_zimage_fsdp2, clip_grad_norm
 from verl_distill.models.zimage import load_zimage
 from verl_distill.models.zimage.compatibility import require_zimage_diffusers
+from verl_distill.optim import AdamWScheduleFree
 from verl_distill.trainers.common import (
     extract_image_batch,
     save_debug_samples,
@@ -281,20 +283,87 @@ def _build_models(config, device):
     return student, {"real": real_score, "fake": fake_score}
 
 
-def _build_optimizer(parameters, config):
-    return torch.optim.AdamW(
-        list(parameters),
-        lr=float(config["lr"]),
-        betas=tuple(config.get("betas", [0.9, 0.99])),
-        weight_decay=float(config.get("weight_decay", 0.0)),
-        foreach=bool(config.get("foreach", True)),
+def _optimizer_type(config: dict) -> str:
+    return str(config.get("type", config.get("name", "adamw"))).strip().lower().replace("-", "_")
+
+
+def _build_optimizer(parameters, config, *, role: str = "optimizer", fsdp_backend: str = ""):
+    optimizer_type = _optimizer_type(config)
+    if optimizer_type in {"adamw", "torch_adamw"}:
+        return torch.optim.AdamW(
+            list(parameters),
+            lr=float(config["lr"]),
+            betas=tuple(config.get("betas", [0.9, 0.99])),
+            weight_decay=float(config.get("weight_decay", 0.0)),
+            foreach=bool(config.get("foreach", True)),
+        )
+    if optimizer_type in {"adamw_schedule_free", "schedule_free_adamw"}:
+        if fsdp_backend != "fsdp1":
+            raise ValueError(f"optimizer.{role}.type=adamw_schedule_free requires FSDP1")
+        return AdamWScheduleFree(
+            list(parameters),
+            lr=float(config["lr"]),
+            betas=tuple(config.get("betas", [0.9, 0.999])),
+            eps=float(config.get("eps", 1.0e-8)),
+            weight_decay=float(config.get("weight_decay", 0.0)),
+            warmup_steps=int(config.get("warmup_steps", 0)),
+            r=float(config.get("r", 0.0)),
+            weight_lr_power=float(config.get("weight_lr_power", 2.0)),
+            inner_momentum=float(config.get("inner_momentum", 0.0)),
+            foreach=bool(config.get("foreach", True)),
+        )
+    raise ValueError(f"Unsupported {role} optimizer type: {optimizer_type!r}")
+
+
+def _optimizer_is_schedule_free(optimizer: torch.optim.Optimizer) -> bool:
+    return (
+        hasattr(optimizer, "train")
+        and hasattr(optimizer, "eval")
+        and any("train_mode" in group for group in optimizer.param_groups)
     )
+
+
+def _optimizer_train(optimizer: torch.optim.Optimizer) -> None:
+    if _optimizer_is_schedule_free(optimizer):
+        optimizer.train()
+
+
+@contextmanager
+def _optimizer_eval_context(optimizer: torch.optim.Optimizer):
+    if not _optimizer_is_schedule_free(optimizer):
+        yield
+        return
+    optimizer.eval()
+    try:
+        yield
+    finally:
+        optimizer.train()
+
+
+@contextmanager
+def _optimizers_eval_context(optimizers: Sequence[torch.optim.Optimizer]):
+    schedule_free_optimizers = [
+        optimizer for optimizer in optimizers if _optimizer_is_schedule_free(optimizer)
+    ]
+    for optimizer in schedule_free_optimizers:
+        optimizer.eval()
+    try:
+        yield
+    finally:
+        for optimizer in schedule_free_optimizers:
+            optimizer.train()
+
+
+def _optimizer_logged_type(optimizer: torch.optim.Optimizer) -> str:
+    return optimizer.__class__.__name__
 
 
 def _build_scheduler(optimizer, config):
     scheduler_type = str(config.get("lr_scheduler", "none")).lower()
     if scheduler_type in {"", "none", "constant"}:
         return None
+    if _optimizer_is_schedule_free(optimizer):
+        raise ValueError("Schedule-free optimizer does not support an external lr_scheduler")
     if scheduler_type != "cosine":
         raise ValueError(f"Unsupported lr_scheduler={scheduler_type!r}")
     return torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -673,10 +742,22 @@ def train_dmd(config):
     ]
     if not score_parameters:
         raise RuntimeError("No trainable fake-score parameters were created")
-    generator_optimizer = _build_optimizer(generator_parameters, config["optimizer"]["generator"])
-    score_optimizer = _build_optimizer(score_parameters, config["optimizer"]["fake_score"])
+    generator_optimizer = _build_optimizer(
+        generator_parameters,
+        config["optimizer"]["generator"],
+        role="generator",
+        fsdp_backend=fsdp_backend,
+    )
+    score_optimizer = _build_optimizer(
+        score_parameters,
+        config["optimizer"]["fake_score"],
+        role="fake_score",
+        fsdp_backend=fsdp_backend,
+    )
     generator_scheduler = _build_scheduler(generator_optimizer, config["optimizer"]["generator"])
     score_scheduler = _build_scheduler(score_optimizer, config["optimizer"]["fake_score"])
+    _optimizer_train(generator_optimizer)
+    _optimizer_train(score_optimizer)
     generator_base_lr = float(config["optimizer"]["generator"]["lr"])
     score_base_lr = float(config["optimizer"]["fake_score"]["lr"])
     generator_base_betas = _optimizer_betas(config["optimizer"]["generator"])
@@ -781,7 +862,8 @@ def train_dmd(config):
             "fake_score_clip=%s grad_accum=%s dfake_gen_update_ratio=%s cfg_real=%s "
             "cfg_fake=%s nfe=%s timestep_shift=%s warmup_type=%s warmup_iterations=%s "
             "debug_cfg=%s debug_timestep_shift=%s generator_betas=%s "
-            "generator_warmup_betas=%s fake_score_betas=%s fake_score_warmup_betas=%s",
+            "generator_warmup_betas=%s fake_score_betas=%s fake_score_warmup_betas=%s "
+            "generator_optimizer=%s fake_score_optimizer=%s",
             config["optimizer"]["generator"].get("lr"),
             config["optimizer"]["generator"].get("warmup_lr"),
             config["optimizer"]["fake_score"].get("lr"),
@@ -802,6 +884,8 @@ def train_dmd(config):
             generator_warmup_betas,
             score_base_betas,
             score_warmup_betas,
+            _optimizer_logged_type(generator_optimizer),
+            _optimizer_logged_type(score_optimizer),
         )
         logger.info(
             "DMD fake_score aux-time: aux_time_embed=%s time_rotary_tensors=%d "
@@ -813,20 +897,31 @@ def train_dmd(config):
         )
     global_step = 0
     resume_from = str(config["runtime"].get("resume_from", "") or "")
+    resume_optimizer_state = bool(config["runtime"].get("resume_optimizer_state", True))
+    allow_partial_optimizer_state = bool(
+        config["runtime"].get("allow_partial_optimizer_state", False)
+    )
     if resume_from:
         if context.world_size > 1:
-            global_step = load_distributed_training_state(
-                resume_from,
-                checkpoint_model,
-                [generator_optimizer, score_optimizer],
-            )
+            if resume_optimizer_state:
+                global_step = load_distributed_training_state(
+                    resume_from,
+                    checkpoint_model,
+                    [generator_optimizer, score_optimizer],
+                    allow_partial_optimizer_state=allow_partial_optimizer_state,
+                )
+            else:
+                global_step = load_distributed_model_state(resume_from, checkpoint_model)
         else:
             state = load_training_state(resume_from, map_location=context.device)
             student.transformer.load_state_dict(state["generator"])
             score["fake"].load_state_dict(state["fake_score"])
-            generator_optimizer.load_state_dict(state["generator_optimizer"])
-            score_optimizer.load_state_dict(state["score_optimizer"])
+            if resume_optimizer_state:
+                generator_optimizer.load_state_dict(state["generator_optimizer"])
+                score_optimizer.load_state_dict(state["score_optimizer"])
             global_step = int(state["step"])
+    _optimizer_train(generator_optimizer)
+    _optimizer_train(score_optimizer)
     epoch = 0
     set_sampler_epoch(loader, epoch)
     data_iterator = iter(loader)
@@ -1154,30 +1249,32 @@ def train_dmd(config):
                         generator_delta_abs,
                         generator_delta_max,
                     )
-            save_debug_samples(student, method, config, context, global_step)
+            with _optimizers_eval_context([generator_optimizer, score_optimizer]):
+                save_debug_samples(student, method, config, context, global_step)
             if save_every > 0 and global_step % save_every == 0:
-                if context.world_size > 1:
-                    if context.is_main_process:
-                        logger.info("Saving distributed DMD checkpoint at step=%d", global_step)
-                    save_distributed_training_state(
-                        output_dir / "checkpoints" / f"step-{global_step}",
-                        checkpoint_model,
-                        [generator_optimizer, score_optimizer],
-                        step=global_step,
-                    )
-                    if context.is_main_process:
-                        logger.info("Saved distributed DMD checkpoint at step=%d", global_step)
-                elif context.is_main_process:
-                    save_training_state(
-                        output_dir / "checkpoints" / f"step-{global_step}.pt",
-                        {
-                            "step": global_step,
-                            "generator": student.transformer.state_dict(),
-                            "fake_score": score["fake"].state_dict(),
-                            "generator_optimizer": generator_optimizer.state_dict(),
-                            "score_optimizer": score_optimizer.state_dict(),
-                        },
-                    )
+                with _optimizers_eval_context([generator_optimizer, score_optimizer]):
+                    if context.world_size > 1:
+                        if context.is_main_process:
+                            logger.info("Saving distributed DMD checkpoint at step=%d", global_step)
+                        save_distributed_training_state(
+                            output_dir / "checkpoints" / f"step-{global_step}",
+                            checkpoint_model,
+                            [generator_optimizer, score_optimizer],
+                            step=global_step,
+                        )
+                        if context.is_main_process:
+                            logger.info("Saved distributed DMD checkpoint at step=%d", global_step)
+                    elif context.is_main_process:
+                        save_training_state(
+                            output_dir / "checkpoints" / f"step-{global_step}.pt",
+                            {
+                                "step": global_step,
+                                "generator": student.transformer.state_dict(),
+                                "fake_score": score["fake"].state_dict(),
+                                "generator_optimizer": generator_optimizer.state_dict(),
+                                "score_optimizer": score_optimizer.state_dict(),
+                            },
+                        )
             was_in_ode_warmup = in_ode_warmup
     finally:
         cleanup_distributed()

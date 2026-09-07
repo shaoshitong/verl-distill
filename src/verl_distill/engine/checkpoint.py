@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint import DefaultLoadPlanner
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
@@ -48,6 +49,19 @@ def load_training_state(path: str | Path, *, map_location="cpu") -> dict[str, An
     return state
 
 
+def _initialize_lazy_optimizer_state(optimizers) -> None:
+    if optimizers is None:
+        return
+    if isinstance(optimizers, torch.optim.Optimizer):
+        optimizer_iter = (optimizers,)
+    else:
+        optimizer_iter = optimizers
+    for optimizer in optimizer_iter:
+        initialize = getattr(optimizer, "initialize_missing_state", None)
+        if callable(initialize):
+            initialize()
+
+
 def save_distributed_training_state(
     path: str | Path,
     model: torch.nn.Module,
@@ -58,6 +72,7 @@ def save_distributed_training_state(
 ) -> None:
     path = Path(path)
     options = StateDictOptions(full_state_dict=False, cpu_offload=True)
+    _initialize_lazy_optimizer_state(optimizers)
     model_state, optimizer_state = get_state_dict(model, optimizers, options=options)
     dcp.save(
         {
@@ -104,16 +119,19 @@ def load_distributed_training_state(
     optimizers,
     *,
     extra_state: dict[str, Any] | None = None,
+    allow_partial_optimizer_state: bool = False,
 ) -> int:
     path = Path(path)
     options = StateDictOptions(full_state_dict=False, cpu_offload=True)
+    _initialize_lazy_optimizer_state(optimizers)
     model_state, optimizer_state = get_state_dict(model, optimizers, options=options)
     state = {
         "model": model_state,
         "optimizer": optimizer_state,
         "step": torch.zeros((), dtype=torch.int64),
     }
-    dcp.load(state, checkpoint_id=str(path))
+    planner = DefaultLoadPlanner(allow_partial_load=True) if allow_partial_optimizer_state else None
+    dcp.load(state, checkpoint_id=str(path), planner=planner)
     set_state_dict(
         model,
         optimizers,

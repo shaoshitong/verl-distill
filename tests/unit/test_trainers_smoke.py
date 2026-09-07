@@ -136,6 +136,138 @@ def test_dmd_trainer_runs_one_optimizer_step(monkeypatch):
     assert not torch.equal(before, student.transformer.transformer.weight)
 
 
+def test_dmd_trainer_runs_one_schedule_free_fake_score_step(monkeypatch):
+    student = _Student()
+    score = {"real": _Wrapper(), "fake": _Wrapper()}
+    monkeypatch.setattr(dmd_trainer, "initialize_distributed", lambda backend: _context())
+    monkeypatch.setattr(dmd_trainer, "cleanup_distributed", lambda: None)
+    monkeypatch.setattr(dmd_trainer, "build_algorithm", lambda name, config: _DMDMethod())
+    monkeypatch.setattr(dmd_trainer, "_build_models", lambda config, device: (student, score))
+    monkeypatch.setattr(dmd_trainer, "build_dataset", lambda config: object())
+    monkeypatch.setattr(
+        dmd_trainer, "build_dataloader", lambda *args, **kwargs: _Loader([_batch()])
+    )
+    config = _base_config("dmd")
+    config["distributed"]["fsdp_backend"] = "fsdp1"
+    config["optimizer"]["fake_score"]["type"] = "adamw_schedule_free"
+    before = score["fake"].transformer.weight.detach().clone()
+    assert dmd_trainer.train_dmd(config) == 1
+    assert not torch.equal(before, score["fake"].transformer.weight)
+
+
+def test_dmd_trainer_runs_one_schedule_free_generator_step(monkeypatch):
+    student = _Student()
+    score = {"real": _Wrapper(), "fake": _Wrapper()}
+    monkeypatch.setattr(dmd_trainer, "initialize_distributed", lambda backend: _context())
+    monkeypatch.setattr(dmd_trainer, "cleanup_distributed", lambda: None)
+    monkeypatch.setattr(dmd_trainer, "build_algorithm", lambda name, config: _DMDMethod())
+    monkeypatch.setattr(dmd_trainer, "_build_models", lambda config, device: (student, score))
+    monkeypatch.setattr(dmd_trainer, "build_dataset", lambda config: object())
+    monkeypatch.setattr(
+        dmd_trainer, "build_dataloader", lambda *args, **kwargs: _Loader([_batch()])
+    )
+    config = _base_config("dmd")
+    config["distributed"]["fsdp_backend"] = "fsdp1"
+    config["optimizer"]["generator"]["type"] = "adamw_schedule_free"
+    before = student.transformer.transformer.weight.detach().clone()
+    assert dmd_trainer.train_dmd(config) == 1
+    assert not torch.equal(before, student.transformer.transformer.weight)
+
+
+def test_schedule_free_fake_score_optimizer_requires_fsdp1():
+    parameter = nn.Parameter(torch.ones(()))
+    config = {"type": "adamw_schedule_free", "lr": 0.1}
+
+    try:
+        dmd_trainer._build_optimizer(
+            [parameter],
+            config,
+            role="fake_score",
+            fsdp_backend="fsdp2",
+        )
+    except ValueError as exc:
+        assert "requires FSDP1" in str(exc)
+    else:
+        raise AssertionError("expected schedule-free fake_score optimizer to require FSDP1")
+
+
+def test_schedule_free_generator_optimizer_requires_fsdp1():
+    parameter = nn.Parameter(torch.ones(()))
+    config = {"type": "adamw_schedule_free", "lr": 0.1}
+
+    try:
+        dmd_trainer._build_optimizer(
+            [parameter],
+            config,
+            role="generator",
+            fsdp_backend="fsdp2",
+        )
+    except ValueError as exc:
+        assert "requires FSDP1" in str(exc)
+    else:
+        raise AssertionError("expected schedule-free generator optimizer to require FSDP1")
+
+
+def test_schedule_free_optimizer_eval_context_restores_train_mode():
+    parameter = nn.Parameter(torch.ones(()))
+    optimizer = dmd_trainer._build_optimizer(
+        [parameter],
+        {"type": "adamw_schedule_free", "lr": 0.1},
+        role="fake_score",
+        fsdp_backend="fsdp1",
+    )
+
+    try:
+        optimizer.step()
+    except RuntimeError as exc:
+        assert "requires optimizer.train" in str(exc)
+    else:
+        raise AssertionError("expected schedule-free step to require train mode")
+
+    dmd_trainer._optimizer_train(optimizer)
+    parameter.grad = torch.ones_like(parameter)
+    optimizer.step()
+    assert optimizer.param_groups[0]["train_mode"] is True
+
+    with dmd_trainer._optimizer_eval_context(optimizer):
+        assert optimizer.param_groups[0]["train_mode"] is False
+
+    assert optimizer.param_groups[0]["train_mode"] is True
+
+
+def test_dmd_model_only_resume_skips_optimizer_state(monkeypatch):
+    student = _Student()
+    score = {"real": _Wrapper(), "fake": _Wrapper()}
+    loaded = {}
+
+    def fake_load_state(path, *, map_location):
+        del path, map_location
+        loaded["called"] = True
+        return {
+            "step": 0,
+            "generator": student.transformer.state_dict(),
+            "fake_score": score["fake"].state_dict(),
+            "generator_optimizer": {"unexpected": "old"},
+            "score_optimizer": {"unexpected": "old"},
+        }
+
+    monkeypatch.setattr(dmd_trainer, "initialize_distributed", lambda backend: _context())
+    monkeypatch.setattr(dmd_trainer, "cleanup_distributed", lambda: None)
+    monkeypatch.setattr(dmd_trainer, "build_algorithm", lambda name, config: _DMDMethod())
+    monkeypatch.setattr(dmd_trainer, "_build_models", lambda config, device: (student, score))
+    monkeypatch.setattr(dmd_trainer, "build_dataset", lambda config: object())
+    monkeypatch.setattr(
+        dmd_trainer, "build_dataloader", lambda *args, **kwargs: _Loader([_batch()])
+    )
+    monkeypatch.setattr(dmd_trainer, "load_training_state", fake_load_state)
+    config = _base_config("dmd")
+    config["runtime"]["resume_from"] = "/tmp/checkpoint.pt"
+    config["runtime"]["resume_optimizer_state"] = False
+
+    assert dmd_trainer.train_dmd(config) == 1
+    assert loaded["called"] is True
+
+
 def test_meanflow_trainer_runs_one_optimizer_step(monkeypatch):
     student = _Student()
     teacher = _Wrapper()
