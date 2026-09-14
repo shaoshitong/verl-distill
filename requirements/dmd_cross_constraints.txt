@@ -1,0 +1,9 @@
+# Key versions used by the cross-ablation runs (Python 3.12).
+torch==2.8.0
+torchvision==0.23.0
+diffusers==0.37.0
+transformers==4.57.0
+huggingface-hub==0.36.0
+accelerate==1.13.0
+peft==0.18.1
+pylance==11.0.0

@@ -1,0 +1,15 @@
+defaults:
+  - dmd_teacher_multirep_joint_ode_warmup_fsdp1.yaml
+
+method:
+  params:
+    # Default to unit weights for the selected representations only.
+    generator_teacher_feature_weights: null
+    score_teacher_feature_weights: null
+
+runtime:
+  max_train_steps: 2500
+  gradient_accumulation_steps: 4
+  save_every_n_steps: 500
+  debug_every_n_steps: 100
+  param_probe_every_n_steps: 1

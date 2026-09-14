@@ -104,11 +104,17 @@ def save_distributed_model_state(
     )
 
 
-def load_distributed_model_state(path: str | Path, model: torch.nn.Module) -> int:
+def load_distributed_model_state(
+    path: str | Path,
+    model: torch.nn.Module,
+    *,
+    allow_partial_model_state: bool = False,
+) -> int:
     options = StateDictOptions(full_state_dict=False, cpu_offload=True)
     model_state = get_model_state_dict(model, options=options)
     state = {"model": model_state, "step": torch.zeros((), dtype=torch.int64)}
-    dcp.load(state, checkpoint_id=str(Path(path)))
+    planner = DefaultLoadPlanner(allow_partial_load=True) if allow_partial_model_state else None
+    dcp.load(state, checkpoint_id=str(Path(path)), planner=planner)
     set_model_state_dict(model, model_state_dict=state["model"], options=options)
     return int(state["step"].item())
 

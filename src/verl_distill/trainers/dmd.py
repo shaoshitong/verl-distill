@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import csv
 import logging
+import math
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Optional, Sequence
@@ -12,9 +14,11 @@ from PIL import Image
 from verl_distill.algorithms import build_algorithm
 from verl_distill.data import build_dataloader, build_dataset
 from verl_distill.engine.checkpoint import (
+    capture_rng_state,
     load_distributed_model_state,
     load_distributed_training_state,
     load_training_state,
+    restore_rng_state,
     save_distributed_training_state,
     save_training_state,
 )
@@ -23,6 +27,7 @@ from verl_distill.engine.fsdp1 import apply_zimage_fsdp1
 from verl_distill.engine.fsdp2 import apply_zimage_fsdp2, clip_grad_norm
 from verl_distill.models.zimage import load_zimage
 from verl_distill.models.zimage.compatibility import require_zimage_diffusers
+from verl_distill.models.zimage.feature_discriminator import TeacherFeatureDiscriminator
 from verl_distill.optim import AdamWScheduleFree
 from verl_distill.trainers.common import (
     extract_image_batch,
@@ -52,6 +57,31 @@ TRACKED_STATS_KEYS = (
     "gen/dmd_pearson4_pearson_weight",
     "gen/dmd_pearson4_mse_weight",
     "gen/loss_gen_dm",
+    "gen/loss_gen_gan",
+    "gen/loss_gen_teacher_features",
+    "gen/teacher_feature_loss_layer_5",
+    "gen/teacher_feature_loss_layer_15",
+    "gen/teacher_feature_loss_layer_25",
+    "gen/teacher_feature_loss_pre_projector",
+    "gen/x_fake_rms",
+    "gan/gan_discriminator_loss",
+    "gan/gan_discriminator_raw_loss",
+    "gan/gan_r1_loss",
+    "gan/gan_r1_weighted_loss",
+    "gan/gan_disc_fake_logit",
+    "gan/gan_disc_real_logit",
+    "gan/gan_disc_fake_prob",
+    "gan/gan_disc_real_prob",
+    "gan/dm_sigma",
+    "gan/gan_disc_x_fake_abs",
+    "gan/gan_disc_x_real_abs",
+    "gan/gan_disc_gen_input_sigma",
+    "gen/gan_generator_raw_loss",
+    "gen/gan_feature_ste_loss",
+    "gen/gan_feature_delta_abs",
+    "gen/gan_feature_live_abs",
+    "gen/gan_gen_fake_logit",
+    "gen/gan_gen_fake_prob",
     "gen/loss_gen_ode_warmup",
     "gen/loss_gen_ode_warmup_unweighted",
     "gen/ode_reward",
@@ -68,6 +98,36 @@ TRACKED_STATS_KEYS = (
     "probe/generator_delta_abs",
     "probe/generator_delta_max",
 )
+
+
+TRACKED_STATS_KEYS += tuple(
+    f"{phase}/teacher_feature_{metric}_{representation}"
+    for phase, metrics in (
+        ("gen", ("loss", "denom", "direction_rms", "live_rms", "real_rms", "fake_rms")),
+        ("score", ("loss", "pred_rms", "target_rms")),
+    )
+    for metric in metrics
+    for representation in ("latent", "layer_5", "layer_15", "layer_25", "pre_projector")
+    if f"{phase}/teacher_feature_{metric}_{representation}" not in TRACKED_STATS_KEYS
+)
+
+
+def _tracked_stats_keys(method) -> tuple[str, ...]:
+    """Reserve both phases' selected feature columns before the first TSV row."""
+    representation_keys = getattr(method, "teacher_feature_representation_keys", None)
+    if representation_keys is None:
+        return TRACKED_STATS_KEYS
+    representations = representation_keys()
+    feature_keys = (
+        f"{phase}/teacher_feature_{metric}_{representation}"
+        for phase, metrics in (
+            ("gen", ("loss", "denom", "direction_rms", "live_rms", "real_rms", "fake_rms")),
+            ("score", ("loss", "pred_rms", "target_rms")),
+        )
+        for metric in metrics
+        for representation in representations
+    )
+    return tuple(dict.fromkeys((*TRACKED_STATS_KEYS, *feature_keys)))
 
 
 @torch.no_grad()
@@ -231,7 +291,15 @@ def _build_models(config, device):
         device=str(device),
     )
     student.transformer.requires_grad_(True)
-    real_score_transformer = ZImageTransformer2DModel.from_pretrained(
+    real_score_cls = (
+        ZImageTransformer2DModelWrapper
+        if (
+            config["method"]["params"].get("generator_objective") in {"gan", "teacher_feature_ste"}
+            or config["method"]["params"].get("score_objective") == "teacher_feature_mse"
+        )
+        else ZImageTransformer2DModel
+    )
+    real_score_transformer = real_score_cls.from_pretrained(
         teacher_model_path,
         subfolder="transformer",
         torch_dtype=torch.bfloat16,
@@ -373,6 +441,25 @@ def _build_scheduler(optimizer, config):
     )
 
 
+def _build_feature_discriminator(config: dict, student, device: torch.device) -> torch.nn.Module:
+    discriminator_config = config.get("discriminator", {})
+    if "latent" in discriminator_config:
+        raise ValueError("DMD GAN requires a teacher multi-feature discriminator, not a latent CNN")
+    discriminator = TeacherFeatureDiscriminator(
+        hidden_dim=int(student.transformer.transformer.config.dim),
+        layer_numbers=discriminator_config.get("multifeature_layers", (4, 12, 20)),
+        transformer_layers=int(discriminator_config.get("transformer_layers", 5)),
+        transformer_heads=int(discriminator_config.get("transformer_heads", 8)),
+        mlp_ratio=float(discriminator_config.get("mlp_ratio", 4.0)),
+    )
+    pretrained = discriminator_config.get("pretrained_checkpoint")
+    if not pretrained:
+        raise ValueError("Teacher-feature GAN requires discriminator.pretrained_checkpoint")
+    report = discriminator.load_pretrained(pretrained)
+    logger.info("DINO-distilled discriminator initialization: %s", report)
+    return discriminator.to(device)
+
+
 def _count_named_parameters(module: torch.nn.Module, needle: str) -> tuple[int, int]:
     params = [parameter for name, parameter in module.named_parameters() if needle in name]
     return len(params), sum(parameter.numel() for parameter in params)
@@ -407,10 +494,13 @@ def _append_stats_row(path: Path, row: dict[str, float | int | bool]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     write_header = not path.exists()
     keys = list(row.keys())
+    if not write_header:
+        with path.open(newline="", encoding="utf-8") as handle:
+            keys = next(csv.reader(handle, delimiter="\t"))
     with path.open("a", encoding="utf-8") as handle:
         if write_header:
             handle.write("\t".join(keys) + "\n")
-        handle.write("\t".join(str(row[key]) for key in keys) + "\n")
+        handle.write("\t".join(str(row.get(key, 0.0)) for key in keys) + "\n")
 
 
 def _set_optimizer_hparams(
@@ -473,6 +563,18 @@ def _gradient_sync_context(module: torch.nn.Module, enabled: bool):
     return _FSDP2GradientSyncContext(module, False)
 
 
+@contextmanager
+def _temporarily_requires_grad(parameters: list[torch.nn.Parameter], enabled: bool):
+    original = [parameter.requires_grad for parameter in parameters]
+    for parameter in parameters:
+        parameter.requires_grad_(enabled)
+    try:
+        yield
+    finally:
+        for parameter, requires_grad in zip(parameters, original, strict=True):
+            parameter.requires_grad_(requires_grad)
+
+
 @torch.no_grad()
 def _clip_grad_norm_for(
     module: torch.nn.Module,
@@ -508,6 +610,27 @@ def _sanitize_nonfinite_grads(parameters: list[torch.nn.Parameter]) -> int:
         dist.all_reduce(count, op=dist.ReduceOp.SUM)
         replacements = int(count.item())
     return replacements
+
+
+@torch.no_grad()
+def _global_grad_squared_norm(parameters: list[torch.nn.Parameter]) -> torch.Tensor:
+    """Squared L2 norm of the current gradients across all ranks, without clipping."""
+    if not parameters:
+        raise ValueError("Gradient norm requires at least one parameter")
+    total = torch.zeros((), device=parameters[0].device, dtype=torch.float64)
+    found = False
+    for parameter in parameters:
+        grad = parameter.grad
+        if grad is None:
+            continue
+        local = grad
+        if hasattr(local, "to_local"):
+            local = local.to_local()
+        total += local.detach().double().square().sum()
+        found = True
+    if found and dist.is_available() and dist.is_initialized():
+        dist.all_reduce(total, op=dist.ReduceOp.SUM)
+    return total
 
 
 @torch.no_grad()
@@ -578,6 +701,7 @@ def _save_dmd_training_debug(
         "real_score_pred_x0": aux.get("pred_real_x0"),
         "fake_score_flow": aux.get("fake_score_flow"),
         "real_score_flow": aux.get("real_score_flow"),
+        "gan_disc_noisy_fake": aux.get("gan_disc_noisy_fake"),
         "gen_input_sigma": aux.get("gen_input_sigma"),
         "dm_sigma": aux.get("dm_sigma"),
         "dmd_fake_score_t": aux.get("dmd_fake_score_t"),
@@ -647,6 +771,25 @@ def train_dmd(config):
         score["fake"].transformer.float()
     generator_sync_module = student.transformer.transformer
     score_sync_module = score["fake"].transformer
+    discriminator = None
+    discriminator_sync_module = None
+    discriminator_clip_module = None
+    discriminator_parameters: list[torch.nn.Parameter] = []
+    gan_objective_enabled = bool(getattr(method, "uses_gan_objective", lambda: False)())
+    teacher_feature_objective_enabled = bool(
+        getattr(method, "uses_teacher_feature_objective", lambda: False)()
+    )
+    if gan_objective_enabled:
+        discriminator = _build_feature_discriminator(config, student, context.device)
+        if context.is_main_process:
+            logger.info(
+                "DMD discriminator: frozen real teacher features=%s; OPD token head params=%d",
+                discriminator.feature_layers,
+                sum(p.numel() for p in discriminator.parameters()),
+            )
+        discriminator.train()
+        discriminator_sync_module = discriminator
+        discriminator_clip_module = discriminator
     generator_clip_module = student.transformer
     score_clip_module = score["fake"]
     if context.world_size > 1:
@@ -694,11 +837,24 @@ def train_dmd(config):
                 reduce_dtype=fsdp_reduce_dtype,
                 buffer_dtype=fsdp_buffer_dtype,
             )
+            if discriminator is not None:
+                discriminator = apply_zimage_fsdp1(
+                    discriminator,
+                    no_split_modules=("TransformerEncoderLayer",),
+                    local_rank=context.local_rank,
+                    param_dtype=fsdp_param_dtype,
+                    reduce_dtype=fsdp_reduce_dtype,
+                    buffer_dtype=fsdp_buffer_dtype,
+                )
             generator_sync_module = student.transformer
             score_sync_module = score["fake"]
+            discriminator_sync_module = discriminator
             generator_clip_module = student.transformer
             score_clip_module = score["fake"]
+            discriminator_clip_module = discriminator
         elif fsdp_backend == "fsdp2":
+            if discriminator is not None:
+                raise ValueError("DMD GAN generator_objective currently requires FSDP1")
             if context.is_main_process:
                 logger.info(
                     "DMD FSDP2 precision: param_dtype=%s forward_autocast=bfloat16 reduce_dtype=%s",
@@ -725,6 +881,8 @@ def train_dmd(config):
     student.transformer.train()
     score["fake"].train()
     score["real"].eval()
+    if discriminator is not None:
+        discriminator.train()
     if context.is_main_process:
         logger.info(
             "DMD generator dtype signature after FSDP/float: %s",
@@ -742,6 +900,12 @@ def train_dmd(config):
     ]
     if not score_parameters:
         raise RuntimeError("No trainable fake-score parameters were created")
+    if discriminator is not None:
+        discriminator_parameters = [
+            parameter for parameter in discriminator.parameters() if parameter.requires_grad
+        ]
+        if not discriminator_parameters:
+            raise RuntimeError("No trainable GAN discriminator parameters were created")
     generator_optimizer = _build_optimizer(
         generator_parameters,
         config["optimizer"]["generator"],
@@ -754,20 +918,40 @@ def train_dmd(config):
         role="fake_score",
         fsdp_backend=fsdp_backend,
     )
+    discriminator_optimizer = None
+    if discriminator is not None:
+        discriminator_optimizer = _build_optimizer(
+            discriminator_parameters,
+            config["optimizer"].get("discriminator", {"lr": 1.0e-5}),
+            role="discriminator",
+            fsdp_backend=fsdp_backend,
+        )
     generator_scheduler = _build_scheduler(generator_optimizer, config["optimizer"]["generator"])
     score_scheduler = _build_scheduler(score_optimizer, config["optimizer"]["fake_score"])
+    discriminator_scheduler = None
+    if discriminator_optimizer is not None:
+        discriminator_scheduler = _build_scheduler(
+            discriminator_optimizer,
+            config["optimizer"].get("discriminator", {}),
+        )
     _optimizer_train(generator_optimizer)
     _optimizer_train(score_optimizer)
+    if discriminator_optimizer is not None:
+        _optimizer_train(discriminator_optimizer)
     generator_base_lr = float(config["optimizer"]["generator"]["lr"])
     score_base_lr = float(config["optimizer"]["fake_score"]["lr"])
+    discriminator_base_lr = float(
+        config["optimizer"].get("discriminator", {"lr": 0.0}).get("lr", 0.0)
+    )
     generator_base_betas = _optimizer_betas(config["optimizer"]["generator"])
     score_base_betas = _optimizer_betas(config["optimizer"]["fake_score"])
-    checkpoint_model = torch.nn.ModuleDict(
-        {
-            "generator": student.transformer,
-            "fake_score": score["fake"],
-        }
-    )
+    checkpoint_modules = {
+        "generator": student.transformer,
+        "fake_score": score["fake"],
+    }
+    if discriminator is not None:
+        checkpoint_modules["discriminator"] = discriminator
+    checkpoint_model = torch.nn.ModuleDict(checkpoint_modules)
     dataset = build_dataset(config["data"])
     loader = build_dataloader(
         dataset,
@@ -847,6 +1031,9 @@ def train_dmd(config):
     score_max_grad_norm = float(
         config["optimizer"]["fake_score"].get("max_grad_norm", max_grad_norm)
     )
+    discriminator_max_grad_norm = float(
+        config["optimizer"].get("discriminator", {}).get("max_grad_norm", max_grad_norm)
+    )
     save_every = int(config["runtime"].get("save_every_n_steps", 1000))
     param_probe_every = int(config["runtime"].get("param_probe_every_n_steps", 50) or 0)
     output_dir = Path(config["runtime"].get("output_dir", "outputs"))
@@ -859,17 +1046,21 @@ def train_dmd(config):
         logger.info(
             "DMD hyperparameters: generator_lr=%s generator_warmup_lr=%s "
             "fake_score_lr=%s fake_score_warmup_lr=%s generator_clip=%s "
-            "fake_score_clip=%s grad_accum=%s dfake_gen_update_ratio=%s cfg_real=%s "
+            "fake_score_clip=%s discriminator_lr=%s discriminator_clip=%s "
+            "grad_accum=%s dfake_gen_update_ratio=%s cfg_real=%s "
             "cfg_fake=%s nfe=%s timestep_shift=%s warmup_type=%s warmup_iterations=%s "
             "debug_cfg=%s debug_timestep_shift=%s generator_betas=%s "
             "generator_warmup_betas=%s fake_score_betas=%s fake_score_warmup_betas=%s "
-            "generator_optimizer=%s fake_score_optimizer=%s",
+            "generator_optimizer=%s fake_score_optimizer=%s discriminator_optimizer=%s "
+            "generator_objective=%s",
             config["optimizer"]["generator"].get("lr"),
             config["optimizer"]["generator"].get("warmup_lr"),
             config["optimizer"]["fake_score"].get("lr"),
             config["optimizer"]["fake_score"].get("warmup_lr"),
             max_grad_norm,
             score_max_grad_norm,
+            discriminator_base_lr,
+            discriminator_max_grad_norm,
             accumulation,
             getattr(method, "dfake_gen_update_ratio", None),
             getattr(method, "real_guidance_scale", None),
@@ -886,6 +1077,12 @@ def train_dmd(config):
             score_warmup_betas,
             _optimizer_logged_type(generator_optimizer),
             _optimizer_logged_type(score_optimizer),
+            (
+                _optimizer_logged_type(discriminator_optimizer)
+                if discriminator_optimizer is not None
+                else "None"
+            ),
+            getattr(method, "generator_objective", None),
         )
         logger.info(
             "DMD fake_score aux-time: aux_time_embed=%s time_rotary_tensors=%d "
@@ -895,36 +1092,78 @@ def train_dmd(config):
             fake_time_rotary_params,
             getattr(method, "fake_score_use_generator_timestep", None),
         )
+        if (
+            teacher_feature_objective_enabled
+            or getattr(method, "score_objective", "mse") == "teacher_feature_mse"
+        ):
+            logger.info(
+                "Teacher representations: layers=%s latent=%s last=%s timestep=%s "
+                "generator_normalize=%s generator_weights=%s score_objective=%s score_weights=%s",
+                getattr(method, "teacher_feature_layers", None),
+                getattr(method, "teacher_feature_include_latent", None),
+                getattr(method, "teacher_feature_include_last", None),
+                getattr(method, "teacher_feature_timestep", None),
+                getattr(method, "teacher_feature_normalize", None),
+                getattr(method, "generator_teacher_feature_weights", None),
+                getattr(method, "score_objective", None),
+                getattr(method, "score_teacher_feature_weights", None),
+            )
     global_step = 0
     resume_from = str(config["runtime"].get("resume_from", "") or "")
     resume_optimizer_state = bool(config["runtime"].get("resume_optimizer_state", True))
     allow_partial_optimizer_state = bool(
         config["runtime"].get("allow_partial_optimizer_state", False)
     )
+    allow_partial_model_state = bool(config["runtime"].get("allow_partial_model_state", False))
     if resume_from:
+        optimizers = [generator_optimizer, score_optimizer]
+        if discriminator_optimizer is not None:
+            optimizers.append(discriminator_optimizer)
         if context.world_size > 1:
             if resume_optimizer_state:
                 global_step = load_distributed_training_state(
                     resume_from,
                     checkpoint_model,
-                    [generator_optimizer, score_optimizer],
+                    optimizers,
                     allow_partial_optimizer_state=allow_partial_optimizer_state,
                 )
             else:
-                global_step = load_distributed_model_state(resume_from, checkpoint_model)
+                global_step = load_distributed_model_state(
+                    resume_from,
+                    checkpoint_model,
+                    allow_partial_model_state=allow_partial_model_state,
+                )
         else:
             state = load_training_state(resume_from, map_location=context.device)
             student.transformer.load_state_dict(state["generator"])
             score["fake"].load_state_dict(state["fake_score"])
+            if discriminator is not None:
+                if "discriminator" in state:
+                    discriminator.load_state_dict(state["discriminator"])
+                elif context.is_main_process:
+                    logger.info(
+                        "Resume checkpoint has no GAN discriminator state; using fresh init"
+                    )
             if resume_optimizer_state:
                 generator_optimizer.load_state_dict(state["generator_optimizer"])
                 score_optimizer.load_state_dict(state["score_optimizer"])
+                if discriminator_optimizer is not None and "discriminator_optimizer" in state:
+                    discriminator_optimizer.load_state_dict(state["discriminator_optimizer"])
+                elif discriminator_optimizer is not None and context.is_main_process:
+                    logger.info(
+                        "Resume checkpoint has no GAN discriminator optimizer state; "
+                        "using fresh optimizer"
+                    )
             global_step = int(state["step"])
     _optimizer_train(generator_optimizer)
     _optimizer_train(score_optimizer)
+    if discriminator_optimizer is not None:
+        _optimizer_train(discriminator_optimizer)
     epoch = 0
     set_sampler_epoch(loader, epoch)
     data_iterator = iter(loader)
+    score_balance_counter = 0
+    generator_balance_counter = 0
     warmup_iterations = int(getattr(method, "warmup_iterations", 0))
     was_in_ode_warmup = bool(
         ode_warmup_enabled and global_step > 0 and global_step <= warmup_iterations
@@ -983,12 +1222,32 @@ def train_dmd(config):
                         score_base_betas,
                     )
             update_generator = method.should_update_generator(global_step)
+            update_score = True
+            update_discriminator = False
+            if teacher_feature_objective_enabled and not in_ode_warmup:
+                fake_updates = int(method.dfake_gen_update_ratio)
+                phase = (global_step - int(method.warmup_iterations) - 1) % (fake_updates + 1)
+                update_score = phase < fake_updates
+                update_generator = phase == fake_updates
+            if discriminator is not None and not in_ode_warmup:
+                # Each F/D/G is a complete GA window and one optimizer update.
+                fake_updates = int(getattr(method, "dfake_gen_update_ratio", 5))
+                phase = (global_step - int(getattr(method, "warmup_iterations", 0)) - 1) % (
+                    fake_updates + 2
+                )
+                update_score = phase < fake_updates
+                update_discriminator = phase == fake_updates
+                update_generator = phase == fake_updates + 1
             score_optimizer.zero_grad(set_to_none=True)
+            if update_discriminator:
+                discriminator_optimizer.zero_grad(set_to_none=True)
             if update_generator:
                 generator_optimizer.zero_grad(set_to_none=True)
             accumulated_score = torch.zeros((), device=context.device)
+            accumulated_discriminator = torch.zeros((), device=context.device)
             accumulated_generator = torch.zeros((), device=context.device)
             score_stats_accum: dict[str, list[torch.Tensor]] = {}
+            discriminator_stats_accum: dict[str, list[torch.Tensor]] = {}
             generator_stats_accum: dict[str, list[torch.Tensor]] = {}
             generator_debug_payload = None
             debug_every = int(config["runtime"].get("debug_every_n_steps", 0) or 0)
@@ -998,8 +1257,9 @@ def train_dmd(config):
                 and global_step % debug_every == 0
                 and context.is_main_process
             )
-            for accumulation_index in range(current_accumulation):
-                is_last_accumulation = accumulation_index == current_accumulation - 1
+
+            def fetch_training_batch():
+                nonlocal epoch, ode_epoch, data_iterator, ode_iterator
                 if in_ode_warmup:
                     if ode_iterator is None or ode_loader is None:
                         raise ValueError(
@@ -1042,52 +1302,240 @@ def train_dmd(config):
                     prompt, prompt_mask, uncond, uncond_mask = student.encode_prompt(
                         text, do_cfg=True
                     )
-                c = [prompt.float(), prompt_mask.float()]
-                e = [uncond.float(), uncond_mask.float()]
-                with _gradient_sync_context(score_sync_module, is_last_accumulation):
-                    with torch.autocast(
-                        device_type=context.device.type,
-                        dtype=torch.bfloat16,
-                        enabled=context.device.type == "cuda",
-                        cache_enabled=False,
-                    ):
-                        score_loss, score_stats = method.score_loss(
-                            generator_model=student.transformer,
-                            score_model=score,
-                            x_real=latents,
-                            c=c,
-                            e=e,
-                            latent_shape=latents.shape,
-                        )
-                    (score_loss / current_accumulation).backward()
-                accumulated_score += score_loss.detach()
-                _merge_stats(score_stats_accum, score_stats)
+                return {
+                    "batch": batch,
+                    "text": text,
+                    "latents": latents,
+                    "initial_noise": initial_noise,
+                    "ode_weight": ode_weight,
+                    "c": [prompt.float(), prompt_mask.float()],
+                    "e": [uncond.float(), uncond_mask.float()],
+                }
 
-                if update_generator:
-                    return_generator_debug = bool(save_dmd_debug and accumulation_index == 0)
-                    with _gradient_sync_context(generator_sync_module, is_last_accumulation):
+            def score_forward(item):
+                return method.score_loss(
+                    generator_model=student.transformer,
+                    score_model=score,
+                    x_real=item["latents"],
+                    c=item["c"],
+                    e=item["e"],
+                    latent_shape=item["latents"].shape,
+                )
+
+            def generator_forward(item, return_debug_tensors=False):
+                return method.generator_loss(
+                    generator_model=student.transformer,
+                    score_model=score,
+                    discriminator_model=discriminator,
+                    x_real=item["latents"],
+                    c=item["c"],
+                    e=item["e"],
+                    latent_shape=item["latents"].shape,
+                    initial_noise=item["initial_noise"],
+                    ode_weight=item["ode_weight"],
+                    return_debug_tensors=return_debug_tensors,
+                )
+
+            balance_lookup = getattr(method, "teacher_feature_balance_for", None)
+            score_balance = (
+                balance_lookup("score") if update_score and balance_lookup is not None else None
+            )
+            generator_balance = (
+                balance_lookup("generator")
+                if update_generator and balance_lookup is not None
+                else None
+            )
+            if in_ode_warmup:
+                score_balance = None
+                generator_balance = None
+            active_balance_role = (
+                "score"
+                if score_balance is not None
+                else "generator"
+                if generator_balance is not None
+                else None
+            )
+            prefetched_items = None
+            if active_balance_role is not None:
+                balance = score_balance if active_balance_role == "score" else generator_balance
+                balance_parameters = (
+                    score_parameters if active_balance_role == "score" else generator_parameters
+                )
+                balance_module = (
+                    score_clip_module if active_balance_role == "score" else generator_clip_module
+                )
+                balance_sync_module = (
+                    score_sync_module if active_balance_role == "score" else generator_sync_module
+                )
+                balance_forward = (
+                    score_forward if active_balance_role == "score" else generator_forward
+                )
+                balance_counter = (
+                    score_balance_counter
+                    if active_balance_role == "score"
+                    else generator_balance_counter
+                )
+                prefetched_items = [fetch_training_batch() for _ in range(current_accumulation)]
+                if balance_counter % balance["measure_every_n_updates"] == 0:
+                    probe_items = (
+                        prefetched_items
+                        if balance["probe_accumulation"] == "full"
+                        else prefetched_items[-1:]
+                    )
+                    balance_keys = method.teacher_feature_representation_keys()
+                    probe_rng = capture_rng_state()
+                    squared_norms: dict[str, float] = {}
+                    for balance_key in balance_keys:
+                        with method.use_teacher_feature_weights(
+                            active_balance_role,
+                            {key: 1.0 if key == balance_key else 0.0 for key in balance_keys},
+                        ):
+                            restore_rng_state(probe_rng)
+                            balance_module.zero_grad(set_to_none=True)
+                            for probe_index, probe_item in enumerate(probe_items):
+                                with _gradient_sync_context(
+                                    balance_sync_module,
+                                    probe_index == len(probe_items) - 1,
+                                ):
+                                    with torch.autocast(
+                                        device_type=context.device.type,
+                                        dtype=torch.bfloat16,
+                                        enabled=context.device.type == "cuda",
+                                        cache_enabled=False,
+                                    ):
+                                        probe_loss, _ = balance_forward(probe_item)
+                                    (probe_loss / len(probe_items)).backward()
+                        squared_norms[balance_key] = float(
+                            _global_grad_squared_norm(balance_parameters).item()
+                        )
+                        balance_module.zero_grad(set_to_none=True)
+                    restore_rng_state(probe_rng)
+                    if not all(math.isfinite(value) for value in squared_norms.values()):
+                        if context.is_main_process:
+                            logger.warning(
+                                "[grad-balance][%s][step=%d] non-finite probe norms %s; "
+                                "keeping the previous weights",
+                                active_balance_role,
+                                global_step,
+                                squared_norms,
+                            )
+                        measured_balance = False
+                    else:
+                        balance_weights, balance_norms = method.teacher_feature_balance_weights(
+                            squared_norms, role=active_balance_role
+                        )
+                        method.set_teacher_feature_weights(active_balance_role, balance_weights)
+                        measured_balance = True
+                    if measured_balance and context.is_main_process:
+                        logger.info(
+                            "[grad-balance][%s][step=%d] probe=%s norms=%s weights=%s",
+                            active_balance_role,
+                            global_step,
+                            balance["probe_accumulation"],
+                            {key: round(value, 6) for key, value in balance_norms.items()},
+                            {key: round(value, 6) for key, value in balance_weights.items()},
+                        )
+                        _append_stats_row(
+                            output_dir / "grad_balance.tsv",
+                            {
+                                "step": global_step,
+                                "role": active_balance_role,
+                                "probe": balance["probe_accumulation"],
+                                **{f"norm_{key}": balance_norms[key] for key in balance_keys},
+                                **{f"weight_{key}": balance_weights[key] for key in balance_keys},
+                                **{
+                                    f"contribution_{key}": balance_weights[key] * balance_norms[key]
+                                    for key in balance_keys
+                                },
+                            },
+                        )
+                if active_balance_role == "score":
+                    score_balance_counter += 1
+                else:
+                    generator_balance_counter += 1
+
+            for accumulation_index in range(current_accumulation):
+                is_last_accumulation = accumulation_index == current_accumulation - 1
+                if prefetched_items is not None:
+                    item = prefetched_items[accumulation_index]
+                else:
+                    item = fetch_training_batch()
+                batch = item["batch"]
+                text = item["text"]
+                latents = item["latents"]
+                initial_noise = item["initial_noise"]
+                c = item["c"]
+                e = item["e"]
+                if update_score:
+                    with _gradient_sync_context(score_sync_module, is_last_accumulation):
                         with torch.autocast(
                             device_type=context.device.type,
                             dtype=torch.bfloat16,
                             enabled=context.device.type == "cuda",
                             cache_enabled=False,
                         ):
-                            generator_out = method.generator_loss(
+                            score_loss, score_stats = score_forward(item)
+                        (score_loss / current_accumulation).backward()
+                    accumulated_score += score_loss.detach()
+                    _merge_stats(score_stats_accum, score_stats)
+
+                if update_discriminator:
+                    with _gradient_sync_context(
+                        discriminator_sync_module,
+                        is_last_accumulation,
+                    ):
+                        with torch.autocast(
+                            device_type=context.device.type,
+                            dtype=torch.bfloat16,
+                            enabled=context.device.type == "cuda",
+                            cache_enabled=False,
+                        ):
+                            discriminator_loss, discriminator_stats = method.discriminator_loss(
                                 generator_model=student.transformer,
                                 score_model=score,
+                                discriminator_model=discriminator,
                                 x_real=latents,
                                 c=c,
                                 e=e,
                                 latent_shape=latents.shape,
                                 initial_noise=initial_noise,
-                                ode_weight=ode_weight,
-                                return_debug_tensors=return_generator_debug,
                             )
-                            if return_generator_debug:
-                                generator_loss, generator_stats, generator_debug = generator_out
-                            else:
-                                generator_loss, generator_stats = generator_out
-                        (generator_loss / current_accumulation).backward()
+                        (discriminator_loss / current_accumulation).backward()
+                    accumulated_discriminator += discriminator_loss.detach()
+                    _merge_stats(discriminator_stats_accum, discriminator_stats)
+
+                if update_generator:
+                    return_generator_debug = bool(save_dmd_debug and accumulation_index == 0)
+                    # Frozen through the backward as well: gradient checkpointing recomputes the
+                    # forward during backward, and a requires_grad change in between breaks it.
+                    generator_frozen_parameters = list(discriminator_parameters)
+                    if getattr(
+                        method, "generator_teacher_feature_needs_live_query", lambda: False
+                    )():
+                        generator_frozen_parameters += list(score_parameters)
+                    with (
+                        _temporarily_requires_grad(
+                            generator_frozen_parameters,
+                            False,
+                        )
+                        if generator_frozen_parameters
+                        else nullcontext()
+                    ):
+                        with _gradient_sync_context(generator_sync_module, is_last_accumulation):
+                            with torch.autocast(
+                                device_type=context.device.type,
+                                dtype=torch.bfloat16,
+                                enabled=context.device.type == "cuda",
+                                cache_enabled=False,
+                            ):
+                                generator_out = generator_forward(
+                                    item, return_debug_tensors=return_generator_debug
+                                )
+                                if return_generator_debug:
+                                    generator_loss, generator_stats, generator_debug = generator_out
+                                else:
+                                    generator_loss, generator_stats = generator_out
+                            (generator_loss / current_accumulation).backward()
                     accumulated_generator += generator_loss.detach()
                     _merge_stats(generator_stats_accum, generator_stats)
                     if in_ode_warmup:
@@ -1117,12 +1565,24 @@ def train_dmd(config):
                             latents.detach(),
                             {key: value.detach() for key, value in generator_debug.items()},
                         )
-            score_nonfinite_grads = _sanitize_nonfinite_grads(score_parameters)
-            score_grad_norm = _clip_grad_norm_for(
-                score_clip_module,
-                score_parameters,
-                score_max_grad_norm,
-            )
+            score_nonfinite_grads = 0
+            score_grad_norm = 0.0
+            if update_score:
+                score_nonfinite_grads = _sanitize_nonfinite_grads(score_parameters)
+                score_grad_norm = _clip_grad_norm_for(
+                    score_clip_module,
+                    score_parameters,
+                    score_max_grad_norm,
+                )
+            discriminator_nonfinite_grads = 0
+            discriminator_grad_norm = 0.0
+            if update_discriminator:
+                discriminator_nonfinite_grads = _sanitize_nonfinite_grads(discriminator_parameters)
+                discriminator_grad_norm = _clip_grad_norm_for(
+                    discriminator_clip_module,
+                    discriminator_parameters,
+                    discriminator_max_grad_norm,
+                )
             do_param_probe = bool(
                 context.is_main_process
                 and param_probe_every > 0
@@ -1130,9 +1590,14 @@ def train_dmd(config):
             )
             score_grad_abs = _grad_abs(score_parameters) if do_param_probe else 0.0
             score_probe_before = _capture_param_probe(score["fake"]) if do_param_probe else {}
-            score_optimizer.step()
-            if score_scheduler is not None and not in_ode_warmup:
-                score_scheduler.step()
+            if update_score:
+                score_optimizer.step()
+                if score_scheduler is not None and not in_ode_warmup:
+                    score_scheduler.step()
+            if update_discriminator:
+                discriminator_optimizer.step()
+                if discriminator_scheduler is not None:
+                    discriminator_scheduler.step()
             generator_grad_norm = 0.0
             generator_grad_abs = 0.0
             generator_delta_abs = 0.0
@@ -1175,26 +1640,42 @@ def train_dmd(config):
                     debug_aux,
                 )
             _reduce_stats_to_global(score_stats_accum)
+            _reduce_stats_to_global(discriminator_stats_accum)
             _reduce_stats_to_global(generator_stats_accum)
             accumulated_score_global = _reduce_mean_scalar(accumulated_score)
+            accumulated_discriminator_global = _reduce_mean_scalar(accumulated_discriminator)
             accumulated_generator_global = _reduce_mean_scalar(accumulated_generator)
             if context.is_main_process:
                 score_means = _stats_to_means(score_stats_accum)
+                discriminator_means = _stats_to_means(discriminator_stats_accum)
                 generator_means = _stats_to_means(generator_stats_accum)
                 stats_row = {
                     "step": global_step,
                     "score_loss": float(accumulated_score_global / current_accumulation),
+                    "discriminator_loss": float(
+                        accumulated_discriminator_global / current_accumulation
+                    ),
                     "generator_loss": float(accumulated_generator_global / current_accumulation),
                     "generator_updated": int(update_generator),
+                    "gan_discriminator": int(discriminator is not None),
+                    "discriminator_updated": int(update_discriminator),
+                    "score_updated": int(update_score),
                     "ode_warmup": int(in_ode_warmup),
                     "accumulation": current_accumulation,
                     "score_grad_norm": score_grad_norm,
+                    "discriminator_grad_norm": discriminator_grad_norm,
                     "generator_grad_norm": generator_grad_norm,
                     "score_nonfinite_grads": score_nonfinite_grads,
+                    "discriminator_nonfinite_grads": discriminator_nonfinite_grads,
                     "generator_nonfinite_grads": generator_nonfinite_grads
                     if update_generator
                     else 0,
                     "score_lr": score_optimizer.param_groups[0]["lr"],
+                    "discriminator_lr": (
+                        discriminator_optimizer.param_groups[0]["lr"]
+                        if discriminator_optimizer is not None
+                        else 0.0
+                    ),
                     "generator_lr": generator_optimizer.param_groups[0]["lr"],
                     "score_beta1": score_optimizer.param_groups[0].get("betas", (0.0, 0.0))[0],
                     "generator_beta1": generator_optimizer.param_groups[0].get("betas", (0.0, 0.0))[
@@ -1209,30 +1690,46 @@ def train_dmd(config):
                 }
                 for key in sorted(score_means):
                     stats_row[f"score/{key}"] = score_means[key]
+                for key in sorted(discriminator_means):
+                    stats_row[f"gan/{key}"] = discriminator_means[key]
                 for key in sorted(generator_means):
                     stats_row[f"gen/{key}"] = generator_means[key]
-                for key in TRACKED_STATS_KEYS:
+                for key in _tracked_stats_keys(method):
                     stats_row.setdefault(key, 0.0)
                 _append_stats_row(output_dir / "dmd_stats.tsv", stats_row)
                 logger.info(
-                    "step=%d score_loss=%.6g generator_loss=%.6g ode_warmup=%d "
-                    "score_grad_norm=%.6g generator_grad_norm=%.6g "
-                    "score_lr=%.6g generator_lr=%.6g score_beta1=%.3g generator_beta1=%.3g "
-                    "score_bad_grads=%d generator_bad_grads=%d "
-                    "dm_grad_abs=%.6g gen_sigma=%.6g score_sigma=%.6g",
+                    "step=%d score_loss=%.6g discriminator_loss=%.6g "
+                    "generator_loss=%.6g ode_warmup=%d score_grad_norm=%.6g "
+                    "discriminator_grad_norm=%.6g generator_grad_norm=%.6g "
+                    "score_lr=%.6g discriminator_lr=%.6g generator_lr=%.6g "
+                    "score_beta1=%.3g generator_beta1=%.3g "
+                    "score_bad_grads=%d discriminator_bad_grads=%d generator_bad_grads=%d "
+                    "dm_grad_abs=%.6g gan_fake_logit=%.6g gen_sigma=%.6g score_sigma=%.6g",
                     global_step,
                     float(accumulated_score_global / current_accumulation),
+                    float(accumulated_discriminator_global / current_accumulation),
                     float(accumulated_generator_global / current_accumulation),
                     int(in_ode_warmup),
                     score_grad_norm,
+                    discriminator_grad_norm,
                     generator_grad_norm,
                     score_optimizer.param_groups[0]["lr"],
+                    (
+                        discriminator_optimizer.param_groups[0]["lr"]
+                        if discriminator_optimizer is not None
+                        else 0.0
+                    ),
                     generator_optimizer.param_groups[0]["lr"],
                     score_optimizer.param_groups[0].get("betas", (0.0, 0.0))[0],
                     generator_optimizer.param_groups[0].get("betas", (0.0, 0.0))[0],
                     score_nonfinite_grads,
+                    discriminator_nonfinite_grads,
                     generator_nonfinite_grads if update_generator else 0,
                     generator_means.get("dm_grad_abs", 0.0),
+                    generator_means.get(
+                        "gan_gen_fake_logit",
+                        discriminator_means.get("gan_disc_fake_logit", 0.0),
+                    ),
                     generator_means.get("gen_input_sigma", 0.0),
                     score_means.get("score_sigma", 0.0),
                 )
@@ -1249,17 +1746,23 @@ def train_dmd(config):
                         generator_delta_abs,
                         generator_delta_max,
                     )
-            with _optimizers_eval_context([generator_optimizer, score_optimizer]):
+            eval_optimizers = [generator_optimizer, score_optimizer]
+            if discriminator_optimizer is not None:
+                eval_optimizers.append(discriminator_optimizer)
+            with _optimizers_eval_context(eval_optimizers):
                 save_debug_samples(student, method, config, context, global_step)
             if save_every > 0 and global_step % save_every == 0:
-                with _optimizers_eval_context([generator_optimizer, score_optimizer]):
+                with _optimizers_eval_context(eval_optimizers):
                     if context.world_size > 1:
                         if context.is_main_process:
                             logger.info("Saving distributed DMD checkpoint at step=%d", global_step)
+                        save_optimizers = [generator_optimizer, score_optimizer]
+                        if discriminator_optimizer is not None:
+                            save_optimizers.append(discriminator_optimizer)
                         save_distributed_training_state(
                             output_dir / "checkpoints" / f"step-{global_step}",
                             checkpoint_model,
-                            [generator_optimizer, score_optimizer],
+                            save_optimizers,
                             step=global_step,
                         )
                         if context.is_main_process:
@@ -1271,8 +1774,22 @@ def train_dmd(config):
                                 "step": global_step,
                                 "generator": student.transformer.state_dict(),
                                 "fake_score": score["fake"].state_dict(),
+                                **(
+                                    {"discriminator": discriminator.state_dict()}
+                                    if discriminator is not None
+                                    else {}
+                                ),
                                 "generator_optimizer": generator_optimizer.state_dict(),
                                 "score_optimizer": score_optimizer.state_dict(),
+                                **(
+                                    {
+                                        "discriminator_optimizer": (
+                                            discriminator_optimizer.state_dict()
+                                        )
+                                    }
+                                    if discriminator_optimizer is not None
+                                    else {}
+                                ),
                             },
                         )
             was_in_ode_warmup = in_ode_warmup

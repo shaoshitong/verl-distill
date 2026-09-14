@@ -1,0 +1,13 @@
+defaults:
+  - dmd_teacher_grad_balance_0_5_15_25.yaml
+
+method:
+  params:
+    # Generator side only: latent (0th) keeps the STE DMD surrogate, 5th/15th/25th switch to
+    # a plain differentiable MSE regression onto the real teacher feature, i.e. no STE and no
+    # detached direction for those three representations. The fake-score side is untouched.
+    generator_teacher_feature_loss_type:
+      latent: ste
+      layer_5: mse
+      layer_15: mse
+      layer_25: mse

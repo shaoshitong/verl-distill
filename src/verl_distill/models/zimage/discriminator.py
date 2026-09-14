@@ -378,7 +378,12 @@ def _fused_tokens(
         if text_film is not None:
             scale, shift = text_film
             h = h * (1.0 + scale) + shift
-        h = block(h)
+        if getattr(module, "gradient_checkpointing", False) and torch.is_grad_enabled():
+            from torch.utils.checkpoint import checkpoint
+
+            h = checkpoint(block, h, use_reentrant=False)
+        else:
+            h = block(h)
         if (
             getattr(module, "ocr_feature_branch", None) is not None
             and block_idx == module.ocr_feature_branch_layer
@@ -1034,6 +1039,7 @@ class ZImageMultiFeatureDiscriminatorHead(nn.Module):
         tt: torch.Tensor | None = None,
         text_features: torch.Tensor = None,
         text_mask: torch.Tensor = None,
+        return_prelogit_features: bool = False,
     ) -> torch.Tensor:
         h = _fused_tokens(
             self,
@@ -1048,6 +1054,9 @@ class ZImageMultiFeatureDiscriminatorHead(nn.Module):
             text_token_count = min(int(h.shape[1]), int(self.ocr_text_branch_max_tokens))
             self.last_ocr_text_branch_tokens = self.ocr_text_branch(h[:, :text_token_count])
         if self.output_mode == "tokens":
+            if return_prelogit_features:
+                prelogit = self.out_mlp[:-1](h)
+                return self.out_mlp[-1](prelogit), prelogit
             output = self.out_mlp(h)
             return output
         output = self.out_mlp(h.mean(dim=1))

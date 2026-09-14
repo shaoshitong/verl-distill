@@ -2,7 +2,7 @@ import copy
 import importlib.util
 import types
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -696,6 +696,7 @@ class ZImageTransformer2DModelWrapper(ZImageTransformer2DModel):
         discriminator_output: Optional[str] = None,
         discriminator_head: Optional[str] = None,
         disable_separate_r_modulation: bool = False,
+        feature_layers: Optional[Tuple[int, ...]] = None,
     ):
         """
         Flow: patchify -> t_embed -> x_embed -> x_refine -> cap_embed -> cap_refine
@@ -918,7 +919,9 @@ class ZImageTransformer2DModelWrapper(ZImageTransformer2DModel):
                 multi_feature_discriminator_head = frozen_head
             else:
                 multi_feature_discriminator_head = dual_head
-        use_multi_feature_discriminator = multi_feature_discriminator_head is not None
+        use_multi_feature_discriminator = (
+            multi_feature_discriminator_head is not None or feature_layers is not None
+        )
         discriminator_features = (
             {} if discriminator_mode and return_discriminator_features else None
         )
@@ -931,6 +934,14 @@ class ZImageTransformer2DModelWrapper(ZImageTransformer2DModel):
                 "multi_feature_discriminator_layer_numbers",
                 (),
             )
+            if feature_layers is not None:
+                layer_numbers = tuple(feature_layers)
+                if (
+                    not layer_numbers
+                    or len(set(layer_numbers)) != len(layer_numbers)
+                    or any(level < 1 or level > len(self.layers) for level in layer_numbers)
+                ):
+                    raise ValueError("feature_layers must select distinct valid teacher layers")
             multi_feature_layer_map = {
                 int(layer_number): f"layer_{slot_idx + 1}"
                 for slot_idx, layer_number in enumerate(layer_numbers)
@@ -973,6 +984,10 @@ class ZImageTransformer2DModelWrapper(ZImageTransformer2DModel):
                 multi_feature_tensors[multi_feature_layer_map[layer_number]] = unified[
                     :, :multi_feature_token_count
                 ]
+
+        if feature_layers is not None:
+            multi_feature_tensors["pre_projector"] = unified[:, :multi_feature_token_count]
+            return multi_feature_tensors
 
         final_layer_key = f"{patch_size}-{f_patch_size}"
         if discriminator_mode and not use_multi_feature_discriminator:

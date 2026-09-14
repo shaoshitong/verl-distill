@@ -1,0 +1,25 @@
+defaults:
+  - dmd_teacher_grad_balance_0_5_15_25.yaml
+
+method:
+  params:
+    # 0th (latent) keeps the original DMD / STE objective; 5th / 15th / 25th switch to the
+    # target-point straight-through form: H(x_fake') vs H(x_real') with
+    # x_real' = x_hat - (x_hat - x_real).detach(), x_fake' likewise.
+    generator_teacher_feature_loss_type:
+      latent: ste
+      layer_5: pair_ste
+      layer_15: pair_ste
+      layer_25: pair_ste
+    # Static per-layer weights derived from the measured per-layer gradient norms
+    # (latent 0.76 / layer_5 0.029 / layer_15 99.1 / layer_25 301.0):
+    # 5th stays 1.0, 15th -> 1/500, 25th -> 1/1500 (their ratio equalises 15th and 25th).
+    generator_teacher_feature_weights:
+      latent: 1.0
+      layer_5: 1.0
+      layer_15: 0.002
+      layer_25: 0.000666667
+    # the manual weights above must not be overwritten by the dynamic balancer
+    teacher_feature_grad_balance:
+      generator: false
+      score: true

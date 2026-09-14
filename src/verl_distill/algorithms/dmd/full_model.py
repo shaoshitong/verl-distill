@@ -192,12 +192,24 @@ class FullModelDMD(StandardDMD):
             target_score = x_fake
             pred_score = pred_x0
 
-        score_mse, score_meta = self._weighted_mse_target(
-            pred_score, target_score, sigma, return_meta=True
-        )
+        feature_stats = {}
+        if self.score_objective == "teacher_feature_mse":
+            score_mse, feature_stats = self._score_teacher_feature_loss(
+                score_model, pred_x0, x_fake, c
+            )
+            score_meta = dict(
+                score_loss_pre_weight=score_mse.detach(),
+                score_loss_post_weight=score_mse.detach(),
+                score_loss_weight=torch.ones((), device=pred_x0.device),
+            )
+        else:
+            score_mse, score_meta = self._weighted_mse_target(
+                pred_score, target_score, sigma, return_meta=True
+            )
         loss = score_mse * self.score_loss_weight
         stats = self._pack_loss_stats(
             loss_score=loss.detach(),
+            **feature_stats,
             score_loss_pre_weight=score_meta["score_loss_pre_weight"],
             score_loss_post_weight=(score_meta["score_loss_post_weight"] * self.score_loss_weight),
             score_loss_weight=score_meta["score_loss_weight"],

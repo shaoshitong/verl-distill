@@ -1,0 +1,12 @@
+defaults:
+- dmd_cross_fake0_gen0to5.yaml
+method:
+  params:
+    score_objective: teacher_feature_mse
+    generator_teacher_feature_weights:
+      latent: 1.0
+      layer_1: 0.0
+      layer_2: 0.0
+      layer_3: 0.0
+      layer_4: 0.0
+      layer_5: 0.0

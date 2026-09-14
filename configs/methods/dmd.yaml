@@ -15,6 +15,13 @@ method:
     dfake_gen_update_ratio: 5
     dm_loss_weight: 1.0
     loss_type: mse
+    generator_objective: dmd_mse
+    gan_generator_loss_weight: 1.0
+    gan_generator_loss_type: logit
+    gan_discriminator_loss_weight: 1.0
+    gan_discriminator_noise_sigma: 0.2
+    gan_r1_weight: 0.0
+    gan_r1_noise_std: 0.01
     gt_grad_loss_weight: 0.0
     grad_norm_eps: 1.0e-6
     score_loss_weight: 1.0

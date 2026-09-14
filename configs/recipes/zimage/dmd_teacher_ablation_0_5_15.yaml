@@ -1,0 +1,6 @@
+defaults:
+  - dmd_teacher_layer_ablation_base.yaml
+method:
+  params:
+    teacher_feature_layers: [5, 15]
+    teacher_feature_include_latent: true

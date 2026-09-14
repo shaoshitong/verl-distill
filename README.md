@@ -22,6 +22,7 @@ This is the recipe used for the validated run:
 - distributed backend: FSDP1
 - mixed precision: parameters `bfloat16`, gradient reduce `float32`, buffers `float32`
 - gradient accumulation: 4
+- fake score optimizer: schedule-free AdamW
 - debug sampling: 1024 x 1024, 4-step trajectory grids every 100 steps
 
 Important DMD settings:
@@ -33,7 +34,8 @@ method.params.warmup_type: ode_pair
 method.params.warmup_iterations: 1000
 optimizer.generator.lr: 1.0e-5
 optimizer.generator.warmup_lr: 1.0e-4
-optimizer.fake_score.lr: 1.0e-5
+optimizer.fake_score.type: adamw_schedule_free
+optimizer.fake_score.lr: 5.0e-5
 optimizer.fake_score.warmup_lr: 0.0
 runtime.max_train_steps: 50000
 distributed.fsdp_backend: fsdp1
@@ -147,3 +149,7 @@ bash scripts/check_public_tree.sh
 ```
 
 Apache-2.0. Model and dataset licenses are not bundled with this repository.
+
+## Shallow DMD Cross Ablation
+
+Reproduce the schedule-free generator and latent/feature STE cross ablation with the [new-node quickstart](docs/dmd_cross_quickstart.md) and [implementation guide](docs/dmd_cross_reproduction_zh.md). The portable recipes are `dmd_cross_fake0_gen0to5` and `dmd_cross_fake0to5_gen0`. Models, data, and the step-1000 checkpoint must be provided separately.

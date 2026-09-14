@@ -1,0 +1,9 @@
+defaults:
+  - dmd_teacher_feature_ste_ode_warmup_fsdp1.yaml
+
+method:
+  params:
+    teacher_feature_layers: [5]
+    teacher_feature_include_last: false
+    teacher_feature_normalize: true
+    grad_norm_eps: 1.0e-6

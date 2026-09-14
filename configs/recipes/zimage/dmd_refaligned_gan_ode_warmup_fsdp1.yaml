@@ -1,0 +1,28 @@
+defaults:
+  - dmd_refaligned_ode_warmup_fsdp1.yaml
+
+method:
+  params:
+    generator_objective: gan
+    gan_generator_loss_weight: 1.0
+    gan_discriminator_loss_weight: 1.0
+    gan_r1_weight: 1.0
+    gan_r1_noise_std: 0.01
+
+optimizer:
+  generator:
+    lr: 1.0e-5
+  discriminator:
+    type: adamw
+    lr: 1.0e-5
+    betas: [0.9, 0.999]
+    weight_decay: 0.0
+    max_grad_norm: 1.0
+    lr_scheduler: none
+
+discriminator:
+  pretrained_checkpoint: ${oc.env:DISCRIMINATOR_CHECKPOINT,}
+  multifeature_layers: [4, 12, 20]
+  transformer_layers: 5
+  transformer_heads: 8
+  mlp_ratio: 4.0

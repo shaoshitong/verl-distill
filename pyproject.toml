@@ -21,7 +21,10 @@ dependencies = [
 train = [
   "diffusers>=0.37.0,<0.38",
   "safetensors>=0.4",
-  "transformers>=4.48",
+  "transformers>=4.57,<5",
+  "accelerate>=1.0",
+  "peft>=0.18",
+  "pylance>=0.20",
 ]
 dev = ["pytest>=8", "ruff>=0.9"]
 

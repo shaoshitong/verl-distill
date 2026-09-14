@@ -1,0 +1,24 @@
+defaults:
+  - dmd_teacher_feature_ste_ode_warmup_fsdp1.yaml
+
+method:
+  params:
+    teacher_feature_layers: [5, 15, 25]
+    teacher_feature_include_latent: true
+    teacher_feature_include_last: false
+    teacher_feature_normalize: true
+    teacher_feature_timestep: 0.2
+    grad_norm_eps: 1.0e-6
+    generator_teacher_feature_weights:
+      latent: 1.0
+      layer_5: 1.0
+      layer_15: 1.0
+      layer_25: 1.0
+    score_objective: teacher_feature_mse
+    score_loss_target: x0
+    score_use_weighting: false
+    score_teacher_feature_weights:
+      latent: 1.0
+      layer_5: 1.0
+      layer_15: 1.0
+      layer_25: 1.0

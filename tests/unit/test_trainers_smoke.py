@@ -1,11 +1,13 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
 import verl_distill.trainers.dmd as dmd_trainer
 import verl_distill.trainers.meanflow as meanflow_trainer
 import verl_distill.trainers.opd_gan as opd_trainer
+from verl_distill.algorithms.dmd import StandardDMD
 
 
 class _Loader(list):
@@ -42,6 +44,24 @@ class _DMDMethod:
 
     def generator_loss(self, generator_model, **kwargs):
         del kwargs
+        return generator_model.transformer.weight.square().sum(), {}
+
+
+class _DMDGANMethod(_DMDMethod):
+    def uses_gan_objective(self):
+        return True
+
+    def should_update_generator(self, step):
+        del step
+        return False
+
+    def discriminator_loss(self, discriminator_model, **kwargs):
+        del kwargs
+        parameter = next(discriminator_model.parameters())
+        return parameter.square().sum(), {}
+
+    def generator_loss(self, generator_model, discriminator_model=None, **kwargs):
+        del discriminator_model, kwargs
         return generator_model.transformer.weight.square().sum(), {}
 
 
@@ -85,6 +105,21 @@ class _Discriminator(nn.Module):
         self.transformer.dual_projector_multi_feature_discriminator_head = nn.Linear(
             1, 1, bias=False
         )
+
+
+class _ConstantFlowGenerator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.flow = nn.Parameter(torch.zeros(()))
+
+    def forward(self, x_t, t, c=None):
+        del t, c
+        return self.flow.expand_as(x_t)
+
+
+class _MeanLogitDiscriminator(nn.Module):
+    def forward(self, latents):
+        return latents.flatten(1).mean(dim=1)
 
 
 def _context():
@@ -172,6 +207,110 @@ def test_dmd_trainer_runs_one_schedule_free_generator_step(monkeypatch):
     before = student.transformer.transformer.weight.detach().clone()
     assert dmd_trainer.train_dmd(config) == 1
     assert not torch.equal(before, student.transformer.transformer.weight)
+
+
+@pytest.mark.parametrize("teacher_features", [False, True])
+def test_dmd_trainer_runs_gan_optimizer_cycle(monkeypatch, teacher_features):
+    student = _Student()
+    score = {"real": _Wrapper(), "fake": _Wrapper()}
+    discriminator = _Wrapper()
+    discriminator.feature_layers = (4, 12, 20)
+    monkeypatch.setattr(dmd_trainer, "initialize_distributed", lambda backend: _context())
+    monkeypatch.setattr(dmd_trainer, "cleanup_distributed", lambda: None)
+    method = _DMDGANMethod()
+    method.dfake_gen_update_ratio = 5
+    method.warmup_iterations = 0
+    monkeypatch.setattr(method, "uses_gan_objective", lambda: not teacher_features)
+    monkeypatch.setattr(
+        method, "uses_teacher_feature_objective", lambda: teacher_features, raising=False
+    )
+    calls = []
+    for name in ("score_loss", "discriminator_loss", "generator_loss"):
+        original = getattr(method, name)
+
+        def tracked_loss(*args, _original=original, _name=name, **kwargs):
+            calls.append(_name)
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(method, name, tracked_loss)
+    monkeypatch.setattr(dmd_trainer, "build_algorithm", lambda name, config: method)
+    monkeypatch.setattr(dmd_trainer, "_build_models", lambda config, device: (student, score))
+
+    def build_discriminator(config, student, device):
+        assert not teacher_features, (
+            "Frozen teacher feature objective must not build a discriminator"
+        )
+        return discriminator
+
+    monkeypatch.setattr(
+        dmd_trainer,
+        "_build_feature_discriminator",
+        build_discriminator,
+    )
+    monkeypatch.setattr(dmd_trainer, "build_dataset", lambda config: object())
+    monkeypatch.setattr(
+        dmd_trainer, "build_dataloader", lambda *args, **kwargs: _Loader([_batch()])
+    )
+    config = _base_config("dmd")
+    cycle = ["fake_score"] * 5 + ([] if teacher_features else ["discriminator"]) + ["generator"]
+    config["runtime"]["max_train_steps"] = 2 * len(cycle)
+    config["runtime"]["gradient_accumulation_steps"] = 4
+    updates = []
+    build_optimizer = dmd_trainer._build_optimizer
+
+    def tracked_optimizer(parameters, options, *, role, **kwargs):
+        optimizer = build_optimizer(parameters, options, role=role, **kwargs)
+        original_step = optimizer.step
+
+        def step(*args, **kwargs):
+            updates.append(role)
+            return original_step(*args, **kwargs)
+
+        optimizer.step = step
+        return optimizer
+
+    monkeypatch.setattr(dmd_trainer, "_build_optimizer", tracked_optimizer)
+    before = discriminator.transformer.weight.detach().clone()
+    assert dmd_trainer.train_dmd(config) == 2 * len(cycle)
+    assert torch.equal(before, discriminator.transformer.weight) == teacher_features
+    assert updates == cycle * 2
+    assert (
+        calls
+        == (
+            ["score_loss"] * 20
+            + ([] if teacher_features else ["discriminator_loss"] * 4)
+            + ["generator_loss"] * 4
+        )
+        * 2
+    )
+
+
+def test_dmd_gan_generator_loss_pushes_fake_logit_up():
+    method = StandardDMD(
+        generator_objective="gan",
+        min_step_percent=0.5,
+        max_step_percent=0.5,
+        backward_simulation=False,
+    )
+    generator = _ConstantFlowGenerator()
+    discriminator = _MeanLogitDiscriminator()
+    x_real = torch.zeros(2, 1, 2, 2)
+    c = [torch.ones(2, 1, 1), torch.ones(2, 1)]
+
+    loss, stats = method.generator_loss(
+        generator_model=generator,
+        score_model={"real": _ConstantFlowGenerator(), "fake": _ConstantFlowGenerator()},
+        discriminator_model=discriminator,
+        x_real=x_real,
+        c=c,
+        e=None,
+        latent_shape=x_real.shape,
+    )
+    loss.backward()
+
+    assert generator.flow.grad is not None
+    assert generator.flow.grad.item() > 0
+    assert "gan_gen_fake_logit" in stats
 
 
 def test_schedule_free_fake_score_optimizer_requires_fsdp1():

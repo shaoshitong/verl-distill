@@ -1,0 +1,8 @@
+defaults:
+  - dmd_teacher_grad_balance_0_5_15_25.yaml
+
+method:
+  params:
+    # STE Jacobian evaluated at the real-branch x0 estimate instead of at the generator output.
+    # The latent (identity) representation and the per-sample denominator are unaffected by design.
+    generator_teacher_feature_anchor: real

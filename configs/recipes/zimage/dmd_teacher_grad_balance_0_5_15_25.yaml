@@ -1,0 +1,22 @@
+defaults:
+  - dmd_teacher_ablation_0_5_15_25.yaml
+
+method:
+  params:
+    # Per-representation gradient-norm balancing for both trained roles.
+    # Target: ||g_latent|| : ||g_5|| : ||g_15|| : ||g_25|| = 8 : 4 : 2 : 1, i.e. every
+    # step down the representation order is `ratio` times weaker than the previous.
+    teacher_feature_grad_balance:
+      enabled: true
+      ratio: 2.0
+      anchor: first
+      generator: true
+      score: true
+      # "full" measures the same gradient-accumulation window that the update applies,
+      # so the measured norms are exactly the ones being reweighted.
+      probe_accumulation: full
+      # Re-measure every N updates and reuse the weights in between; cost per role update
+      # is (1 + representations / N) forward-backward windows.
+      measure_every_n_updates: 4
+      max_weight: 1000.0
+      min_norm: 1.0e-12

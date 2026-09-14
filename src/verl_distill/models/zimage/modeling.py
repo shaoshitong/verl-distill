@@ -163,6 +163,7 @@ class GenTransformer(torch.nn.Module):
         self.transformer.enable_lora()
 
     def forward(self, x_t, t, c=None, tt=None, **kwargs):
+        feature_layers = kwargs.pop("feature_layers", None)
         discriminator_mode = bool(kwargs.pop("discriminator_mode", False))
         discriminator_return_raw = bool(kwargs.pop("return_raw", False))
         skip_aux_time = bool(kwargs.pop("skip_aux_time", False))
@@ -308,7 +309,11 @@ class GenTransformer(torch.nn.Module):
             if return_discriminator_features:
                 transformer_kwargs["return_discriminator_features"] = True
 
+        if feature_layers is not None:
+            transformer_kwargs["feature_layers"] = tuple(feature_layers)
         output = self.transformer(**transformer_kwargs)
+        if feature_layers is not None:
+            return output
 
         if discriminator_mode:
             if return_discriminator_features:
