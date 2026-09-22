@@ -7,7 +7,7 @@ from verl_distill.config import load_config
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train a Z-Image distillation method")
+    parser = argparse.ArgumentParser(description="Train a diffusion distillation method")
     parser.add_argument("--config", required=True)
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument(
@@ -26,6 +26,18 @@ def main():
     name = method.get("name")
     if not name:
         raise ValueError("Configuration must define method.name")
+    if config["model"].get("family") == "qwen_image21":
+        if args.dry_run:
+            params = method["params"]
+            print(json.dumps({"family": "qwen_image21", "config": config,
+                "reflow_updates": params["reflow_updates"],
+                "fake_updates": params["fake_updates"],
+                "dmd_generator_updates": int(params["fake_updates"]) // 5}, indent=2))
+            return
+        from verl_distill.trainers.qwen_image21 import train
+
+        train(config)
+        return
     algorithm = build_algorithm(name, method.get("params", {}))
     if args.dry_run:
         print(json.dumps({"method": name, "algorithm": type(algorithm).__name__}, indent=2))

@@ -26,6 +26,15 @@ train = [
   "peft>=0.18",
   "pylance>=0.20",
 ]
+qwen21 = [
+  "diffusers @ git+https://github.com/huggingface/diffusers@80c7ed262aeffbeb43ef13ae04baeb9b84515a69",
+  "transformers==5.17.0",
+  "accelerate==1.13.0",
+  "huggingface-hub==1.32.0",
+  "tokenizers==0.23.2",
+  "safetensors==0.8.0",
+  "peft==0.18.1",
+]
 dev = ["pytest>=8", "ruff>=0.9"]
 
 [project.scripts]
@@ -33,6 +42,9 @@ verl-distill = "verl_distill.cli.train:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/verl_distill"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel.force-include]
 "configs" = "verl_distill/configs"

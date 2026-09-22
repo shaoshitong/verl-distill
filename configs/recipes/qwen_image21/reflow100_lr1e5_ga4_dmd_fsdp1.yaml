@@ -1,0 +1,20 @@
+# Fresh HF -> 100 REFLOW updates -> 3000 Fake / 600 Generator updates.
+# Training samples one of six timesteps; six-step Euler rollout is evaluation only.
+defaults:
+  - reflow_dmd_fsdp1.yaml
+
+method:
+  params:
+    reflow_updates: 100
+
+optimizer:
+  reflow:
+    lr: 1.0e-5
+
+runtime:
+  reflow_gradient_accumulation_steps: 4
+  reflow_checkpoint_steps: [1, 20, 100]
+  debug_reflow_steps: [1]
+  offload_scores_for_generator_backward: true
+  offload_inactive_for_fake: true
+  early_dmd_checkpoint_steps: [5, 40, 45]

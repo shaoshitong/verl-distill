@@ -1,0 +1,551 @@
+"""Qwen-Image-2.1 REFLOW(1000) -> DMD(Fake 3000 / Generator 600), FSDP1."""
+from __future__ import annotations
+
+import copy
+import json
+import logging
+import os
+import random
+import sys
+import time
+import traceback
+from functools import partial
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.distributed as dist
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecision
+from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
+from torch.utils.checkpoint import checkpoint
+
+from verl_distill.algorithms.dmd.qwen_image21 import (
+    UpdateState, dmd_surrogate, fake_score_loss, reflow_loss, renoise, x0_from_velocity,
+)
+from verl_distill.data.qwen_image21 import (
+    QwenPairDataset, RankCursor, atomic_json, canonical_hash, read_manifest, sha256, estimated_training_tokens,
+)
+from verl_distill.engine.distributed import cleanup_distributed, initialize_distributed
+from verl_distill.engine.qwen_checkpoint import (
+    capture_rng_state, restore_rng_state, collective_call, inspect_checkpoint,
+    restore_checkpoint, save_checkpoint,
+)
+from verl_distill.models.qwen_image21.configuration import validate_qwen_config
+from verl_distill.models.qwen_image21.modeling import (
+    ConditionStore, QwenDecoder, QwenSchedule, load_transformer, model_identity,
+    predict_velocity, require_qwen_runtime,
+)
+from verl_distill.trainers.qwen_image21_debug import debug_event, tensor_stats
+
+from verl_distill.engine.qwen_score_offload import offload_score_shards, PhaseShardOffload
+
+logger = logging.getLogger(__name__)
+
+
+def wrap_model(model, local_rank, trainable):
+    # FP32 master shards, BF16 forward weights, FP32 reductions and stored gradients.
+    model.float().requires_grad_(trainable)
+    if trainable:
+        # Frozen conditioning encoders; train the DiT blocks and image projections.
+        model.time_text_embed.requires_grad_(False)
+        model.txt_in.requires_grad_(False)
+    audit = {"trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
+             "frozen_parameters": sum(p.numel() for p in model.parameters() if not p.requires_grad),
+             "frozen_names": [n for n, p in model.named_parameters() if not p.requires_grad]}
+    expected_blocks = len(model.transformer_blocks)
+    if trainable:
+        model.enable_gradient_checkpointing(
+            gradient_checkpointing_func=partial(checkpoint, use_reentrant=False))
+    wrapped = FSDP(
+        model, device_id=local_rank, use_orig_params=True,
+        auto_wrap_policy=partial(lambda_auto_wrap_policy,
+                                 lambda_fn=lambda m: type(m).__name__ == "QwenImage21TransformerBlock"),
+        mixed_precision=MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.float32,
+                                       buffer_dtype=torch.float32, keep_low_precision_grads=False),
+        forward_prefetch=False, limit_all_gathers=True,
+    )
+
+    actual_blocks = sum(isinstance(m, FSDP) and
+                        type(m.module).__name__ == "QwenImage21TransformerBlock"
+                        for m in wrapped.modules())
+    if actual_blocks != expected_blocks:
+        raise RuntimeError(f"FSDP block coverage: {actual_blocks}/{expected_blocks}")
+    audit.update(fsdp_blocks=actual_blocks, gradient_checkpointing=model.gradient_checkpointing,
+                 use_orig_params=True, trainable=trainable,
+                 attention_backend=getattr(model, "_qwen_attention_backend", "sdpa"))
+    wrapped._infra_audit = audit
+    logger.info("Qwen infrastructure: %s", audit)
+    return wrapped
+
+
+def optimizer_for(model, spec):
+    return torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=float(spec["lr"]),
+                             betas=tuple(float(x) for x in spec["betas"]),
+                             weight_decay=float(spec["weight_decay"]))
+
+
+def copy_shards(source, target):
+    # Identical Qwen configs and auto-wrap produce identically ordered flat shards.
+    source_parameters, target_parameters = list(source.named_parameters()), list(target.named_parameters())
+    if [(n, tuple(p.shape)) for n, p in source_parameters] != [(n, tuple(p.shape)) for n, p in target_parameters]:
+        raise ValueError("Generator/Fake FSDP layouts differ; cannot initialize Fake by shard copy")
+    with torch.no_grad():
+        for (_, a), (_, b) in zip(source_parameters, target_parameters, strict=True):
+            if a.numel() and a.data_ptr() == b.data_ptr():
+                raise ValueError("Generator/Fake unexpectedly share storage")
+            b.copy_(a)
+
+
+def require_finite(value, label, device):
+    bad = torch.tensor(int(not torch.isfinite(value.detach()).all()), device=device, dtype=torch.int32)
+    dist.all_reduce(bad, op=dist.ReduceOp.MAX)
+    if bad.item():
+        raise FloatingPointError(f"Nonfinite {label}; stopping all ranks before optimizer update")
+
+
+def scalar(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().float().mean().item()
+    return value
+
+
+def snapshot_tensors(tensors):
+    return {k: v.detach().float().cpu().clone() for k, v in tensors.items()
+            if isinstance(v, torch.Tensor)}
+
+
+def post_update_actions(state, phase, reflow_total, fake_total, runtime, save, debug):
+    """Commit due training state before any optional image generation or VAE load."""
+    if phase == "reflow":
+        checkpoints = runtime.get("reflow_checkpoint_steps", [reflow_total])
+        if state.reflow_updates in checkpoints or state.reflow_updates == reflow_total:
+            save(f"reflow_step_{state.reflow_updates:06d}")
+        interval = int(runtime.get("debug_every_reflow_updates", 0))
+        periodic = interval > 0 and state.reflow_updates % interval == 0
+        final = state.reflow_updates == reflow_total and bool(runtime.get("debug_after_reflow", True))
+        if periodic or final or state.reflow_updates in runtime.get("debug_reflow_steps", []):
+            debug()
+    if phase == "generator":
+        if (state.fake_updates % int(runtime["save_every_fake_updates"]) == 0
+                or state.fake_updates == fake_total
+                or state.fake_updates in runtime.get("early_dmd_checkpoint_steps", [])):
+            save(f"fake_step_{state.fake_updates:06d}")
+        if state.fake_updates % int(runtime["debug_every_fake_updates"]) == 0:
+            debug()
+
+
+def train(config):
+    validate_qwen_config(config)
+    require_qwen_runtime()
+    context = initialize_distributed(timeout_seconds=int(config["distributed"].get("timeout_seconds", 1800)))
+    if context.device.type != "cuda":
+        cleanup_distributed()
+        raise RuntimeError("Qwen FSDP1 training requires CUDA; use CPU unit tests for mathematics")
+    # FSDP1 requires a process group even for a one-GPU torchrun process.
+    if not dist.is_initialized():
+        if "MASTER_ADDR" not in os.environ:
+            raise RuntimeError("Launch this trainer with torchrun (also for one GPU)")
+        dist.init_process_group("nccl", rank=context.rank, world_size=context.world_size)
+    try:
+        _train(config, context)
+    except Exception as exc:
+        # Best effort local failure record: never enter a new collective from an
+        # arbitrary exception path, because another worker may be in FSDP.
+        try:
+            atomic_json(Path(config["runtime"]["output_dir"]) /
+                        f"failure-rank-{context.rank:05d}.json",
+                        {"error": repr(exc), "traceback": traceback.format_exc(),
+                         "time": time.time(), "rank": context.rank})
+        except OSError:
+            pass
+        traceback.print_exc()
+        sys.stderr.flush()
+        sys.stdout.flush()
+        # An asymmetric failure must not enter NCCL teardown or Python atexit:
+        # torchrun observes this exit and terminates the remaining workers.
+        os._exit(1)
+    else:
+        cleanup_distributed()
+
+
+def _train(config, context):
+    rank, device, world = context.rank, context.device, context.world_size
+    runtime, params, data = config["runtime"], config["method"]["params"], config["data"]
+    seed = int(runtime.get("seed", 42))
+    random.seed(seed + rank)
+    np.random.seed((seed + rank) % 2**32)
+    torch.manual_seed(seed + rank)
+    torch.cuda.manual_seed_all(seed + rank)
+    output = Path(runtime["output_dir"])
+    collective_call("create run output", lambda: output.mkdir(parents=True, exist_ok=True))
+    # A fresh run never silently adopts another run's output/checkpoints/debug files.
+    def reserve_run():
+        if rank == 0:
+            marker = output / "run.json"
+            if marker.exists():
+                raise FileExistsError("Choose a fresh OUTPUT_DIR, including when resuming a checkpoint")
+            atomic_json(marker, {"started_at": time.time(), "config": config, "world_size": world})
+    collective_call("reserve run", reserve_run)
+    dataset = collective_call("load training manifest", lambda: QwenPairDataset(
+        data["manifest"], data.get("output_root"), verify_payloads=True))
+    evaluation = collective_call("load eval manifest", lambda: read_manifest(data["eval_manifest"]))
+    if evaluation["purpose"] != "eval" or len(evaluation["records"]) != 64:
+        raise ValueError("Evaluation manifest must contain all 64 CSV prompts")
+    hashes = collective_call("hash manifests", lambda: {
+        "train": sha256(data["manifest"]), "eval": sha256(data["eval_manifest"])})
+    csv_hash = collective_call("hash debug CSV", lambda: sha256(runtime["debug_prompts_csv"]))
+    if csv_hash != evaluation["prompts_csv_sha256"]:
+        raise ValueError("CSV changed since evaluation manifest was created")
+    identity = collective_call("hash model assets on rank 0", lambda: model_identity(
+        config["model"]["pretrained_model"]) if rank == 0 else None)
+    objects = [identity]
+    dist.broadcast_object_list(objects, src=0)
+    identity = objects[0]
+    # Rank-local model directories must match actual weight/config identities too.
+    # Operators may stage one identical path per node; hashing each rank is intentionally
+    # conservative rather than trusting directory names as model identity.
+    def verify_local_identity():
+        local_identity = model_identity(config["model"]["pretrained_model"])
+        if local_identity != identity:
+            raise ValueError("Rank-local Qwen assets differ")
+    collective_call("verify rank-local model assets", verify_local_identity)
+    store = collective_call("open condition cache", lambda: ConditionStore(data["condition_cache"], identity, hashes))
+    collective_call("check complete condition coverage", lambda: [store.validate_record(r)
+                for r in dataset.records + evaluation["records"]])
+    schedule = QwenSchedule(config["model"]["pretrained_model"], float(params["generator_terminal"]))
+    # Paths may move on resume, but numerical/configuration/data identities may not.
+    numerical_runtime = {k: v for k, v in runtime.items() if k not in
+                         ("output_dir", "resume_from", "debug_prompts_csv",
+                          "debug_prompt_count", "debug_comparison_steps", "allow_infra_resume_change",
+                          "resume_refinement", "resume_dmd_fork")}
+    contract = {"manifest_hashes": hashes, "condition_index": sha256(Path(data["condition_cache"]) / "index.json"),
+                "csv_sha256": csv_hash, "model_identity": canonical_hash(identity),
+                "scheduler": canonical_hash(schedule.config), "params": params,
+                "optimizer": config["optimizer"], "runtime": numerical_runtime,
+                "distributed": config["distributed"],
+                "trainable_policy": "dit_freeze_time_text_embed_and_txt_in_v1",
+                "fsdp_use_orig_params": True}
+    all_contracts = [None] * world
+    dist.all_gather_object(all_contracts, contract)
+    if any(c != contract for c in all_contracts):
+        raise ValueError("Ranks resolved different training contracts")
+    state = UpdateState()
+    resume = runtime.get("resume_from")
+    if resume:
+        saved = collective_call("inspect checkpoint", lambda: inspect_checkpoint(
+            resume, contract, allow_infra_change=bool(runtime.get("allow_infra_resume_change", False)),
+            refinement=runtime.get("resume_refinement"), dmd_fork=bool(runtime.get("resume_dmd_fork", False))))
+        state = UpdateState(**saved["updates"])
+    state.validate(int(params["reflow_updates"]), int(params["fake_updates"]))
+    costs = ([estimated_training_tokens(r) for r in dataset.records]
+             if runtime.get("data_ordering", "random") == "bucketed_v1" else None)
+    cursor = RankCursor(len(dataset), rank, world, seed, costs=costs,
+                        bucket_batches=int(runtime.get("bucket_batches", 64)),
+                        allow_ordering_migration=bool(runtime.get("allow_infra_resume_change", False)))
+    reset_data_cursor = bool(resume and saved["contract"]["manifest_hashes"]["train"]
+                             != contract["manifest_hashes"]["train"])
+    if reset_data_cursor:
+        def verify_dataset_extension():
+            previous = read_manifest(saved["config"]["data"]["manifest"])
+            current_rows = {(r["kind"], r["id"]): r for r in dataset.records}
+            if any(current_rows.get((r["kind"], r["id"])) != r for r in previous["records"]):
+                raise ValueError("Refinement data must include every old record unchanged")
+        collective_call("verify explicitly authorized dataset extension", verify_dataset_extension)
+    if resume and saved["contract"] != contract:
+        collective_call("record explicit infrastructure migration", lambda: atomic_json(
+            output / "infra_migration.json", {"checkpoint": str(resume),
+                "old_contract": saved["contract"], "new_contract": contract,
+                "data_policy": ("new dataset epoch zero; restore optimizer and RNG" if reset_data_cursor else
+                                "only rebucket unconsumed epoch suffix; restore optimizer and RNG")}) if rank == 0 else None)
+    generator = wrap_model(load_transformer(config["model"]["pretrained_model"],
+                                             runtime.get("attention_backend", "sdpa")), context.local_rank, True)
+    generator.train()
+    collective_call("write infrastructure audit", lambda: atomic_json(
+        output / f"infra-rank-{rank:05d}.json", generator._infra_audit))
+    fake = real = fake_optimizer = None
+    gen_spec = config["optimizer"]["generator" if state.dmd_initialized else "reflow"]
+    gen_optimizer = optimizer_for(generator, gen_spec)
+
+    def load_scores():
+        fake_model = wrap_model(load_transformer(config["model"]["pretrained_model"],
+                                             runtime.get("attention_backend", "sdpa")), context.local_rank, True)
+        real_model = wrap_model(load_transformer(config["model"]["pretrained_model"],
+                                             runtime.get("attention_backend", "sdpa")), context.local_rank, False)
+        fake_model.train()
+        real_model.eval()
+        return fake_model, real_model
+
+    if state.dmd_initialized:
+        fake, real = load_scores()
+        fake_optimizer = optimizer_for(fake, config["optimizer"]["fake_score"])
+    models = {"generator": generator}
+    optimizers = {"generator": gen_optimizer}
+    if fake is not None:
+        models["fake"] = fake
+        optimizers["fake"] = fake_optimizer
+    if resume:
+        if saved["models"] != list(models):
+            raise ValueError("Checkpoint phase/model inventory mismatch")
+        restore_checkpoint(resume, models, optimizers, cursor, rank=rank,
+                           reset_data_cursor=reset_data_cursor)
+        # DCP restores optimizer param_groups, including the OLD LR. Apply the
+        # validated new recipe only after loading; retain Adam moments and step.
+        loaded_lrs = [float(group["lr"]) for group in gen_optimizer.param_groups]
+        for group in gen_optimizer.param_groups:
+            group["lr"] = float(gen_spec["lr"])
+        collective_call("record restored optimizer learning rate", lambda: atomic_json(
+            output / f"resume-optimizer-rank-{rank:05d}.json", {
+                "loaded_lrs": loaded_lrs, "effective_lrs": [g["lr"] for g in gen_optimizer.param_groups],
+                "optimizer_state_entries": len(gen_optimizer.state), "reset_data_cursor": reset_data_cursor,
+                "updates": state.state_dict() }))
+    del models, optimizers  # Do not retain the REFLOW AdamW state after phase transition.
+    decoder = None  # VAE initialized only for the first scheduled debug event.
+    reflow_total, fake_total = int(params["reflow_updates"]), int(params["fake_updates"])
+    debug_snapshots = {}
+    last_checkpoint = None
+    log_path = output / "logs" / f"rank-{rank:05d}.jsonl"
+    collective_call("create logs", lambda: log_path.parent.mkdir(parents=True, exist_ok=True))
+
+    def save(name):
+        nonlocal last_checkpoint
+        if rank == 0:
+            logger.info("Saving checkpoint %s before any scheduled debug", name)
+        cp_models, cp_optimizers = {"generator": generator}, {"generator": gen_optimizer}
+        if state.dmd_initialized:
+            cp_models["fake"], cp_optimizers["fake"] = fake, fake_optimizer
+        last_checkpoint = save_checkpoint(output / "checkpoints" / name, cp_models, cp_optimizers,
+                                          state, cursor, contract, config, rank=rank)
+        if rank == 0:
+            logger.info("Checkpoint committed: %s", last_checkpoint)
+
+    def get_decoder():
+        nonlocal decoder
+        if decoder is None:
+            rng = capture_rng_state()
+            try:
+                decoder = collective_call("load debug VAE", lambda: QwenDecoder(
+                    config["model"]["pretrained_model"], device))
+            finally:
+                restore_rng_state(rng)
+        return decoder
+
+    generator_residency = real_residency = None
+    while True:
+        phase = state.next_phase(reflow_total, fake_total)
+        if phase == "complete":
+            break
+        if phase != "reflow" and not state.dmd_initialized:
+            # Only the fresh phase transition copies weights. Resume never repeats it.
+            # Release REFLOW Adam moments before loading the two score models;
+            # the previous loop's `optimizer` may still reference the old optimizer.
+            gen_optimizer.state.clear()
+            gen_optimizer = optimizer_for(generator, config["optimizer"]["generator"])
+            fake, real = load_scores()
+            fake_initialization = params.get("fake_initialization", "reflow_generator")
+            if fake_initialization == "reflow_generator":
+                collective_call("initialize independent Fake shards", lambda: copy_shards(generator, fake))
+            elif fake_initialization != "hf":
+                raise ValueError(f"Unsupported fake_initialization: {fake_initialization}")
+            collective_call("record DMD initialization", lambda: atomic_json(
+                output / f"dmd-initialization-rank-{rank:05d}.json", {
+                    "generator_checkpoint": str(resume or "in-process REFLOW"),
+                    "fake_initialization": fake_initialization,
+                    "real_initialization": "hf",
+                    "hf_model": config["model"]["pretrained_model"],
+                    "generator_lr": config["optimizer"]["generator"]["lr"],
+                    "fake_lr": config["optimizer"]["fake_score"]["lr"],
+                    "fresh_dmd_optimizers": True}))
+            fake_optimizer = optimizer_for(fake, config["optimizer"]["fake_score"])
+            state.dmd_initialized = True
+        if phase != "reflow" and runtime.get("offload_inactive_for_fake", False):
+            if generator_residency is None:
+                generator_residency = PhaseShardOffload(generator)
+                real_residency = PhaseShardOffload(real)
+            if phase == "fake_score":
+                real_residency.offload()  # Remains on CPU for all five Fake updates.
+            else:
+                real_residency.load()
+                generator_residency.load()
+        before = state.state_dict()
+        ga = int(runtime["reflow_gradient_accumulation_steps"] if phase == "reflow"
+                 else runtime["gradient_accumulation_steps"])
+        is_fake = phase == "fake_score"
+        active = fake if is_fake else generator
+        optimizer = fake_optimizer if is_fake else gen_optimizer
+        spec = config["optimizer"][phase]
+        optimizer.zero_grad(set_to_none=True)
+        optimizer_step = state.fake_updates + 1 if is_fake else state.fake_updates
+        capture = phase != "reflow" and optimizer_step % int(runtime["debug_every_fake_updates"]) == 0
+        captures, micro_logs = [], []
+        hit_counts = [0] * 6
+        started = time.monotonic()
+        torch.cuda.reset_peak_memory_stats(device)
+        # A bounded first-shard probe exposes accidental no-op/phase leakage in logs.
+        probe_param = next(p for p in active.parameters() if p.requires_grad and p.numel())
+        probe_before = probe_param.detach().flatten()[:1024].clone()
+        for ga_index in range(ga):
+            fetched = time.monotonic()
+            item = collective_call("load next data pair", lambda: dataset[cursor.next_index()])
+            row = item["record"]
+            condition = collective_call("load sample condition", lambda: store.get(row, device))
+            target_tokens = item["clean"].shape[1]
+            reference_tokens = (condition["reference_latents"].shape[1]
+                                if condition["reference_latents"] is not None else 0)
+            vlm_length = condition["encoder_hidden_states"].shape[1]
+            text_tokens = int((~condition["img_mask"][0, :vlm_length]).sum().item())
+            atomic_json(output / f"active-microbatch-rank-{rank:05d}.json", {
+                "phase": phase, "updates_before": before, "ga_index": ga_index,
+                "sample_id": row["id"], "reference_count": len(row["reference_images"]),
+                "target_tokens": target_tokens, "reference_tokens": reference_tokens,
+                "text_tokens": text_tokens, "total_tokens": target_tokens+reference_tokens+text_tokens,
+                "time": time.time()})
+            clean = item["clean"].to(device)
+            levels = schedule.levels(row["height"], row["width"], device=device)
+            step_index = int(torch.randint(6, (1,), device=device).item())
+            hit_counts[step_index] += 1
+            sigma = levels[step_index:step_index+1]
+            noise = item["noise"].to(device) if phase == "reflow" else torch.randn_like(clean)
+            gen_input = renoise(clean, noise, sigma)
+            data_seconds = time.monotonic() - fetched
+            forward_start = time.monotonic()
+            tensors = {"generator_input": gen_input, "generator_input_noise": noise,
+                       "generator_sigma": sigma}
+            fake_offload_stats = {}
+            if phase == "reflow":
+                velocity = predict_velocity(generator, gen_input, sigma, condition)
+                loss = reflow_loss(velocity, clean, noise)
+                tensors.update(generator_x0=x0_from_velocity(gen_input, velocity, sigma),
+                               reflow_target_flow=noise-clean, predicted_velocity=velocity)
+                aux = {}
+            else:
+                if is_fake and generator_residency is not None:
+                    fake_offload_stats["generator_reload_seconds"] = generator_residency.load()
+                with torch.set_grad_enabled(not is_fake):
+                    gen_velocity = predict_velocity(generator, gen_input, sigma, condition)
+                    generated = x0_from_velocity(gen_input, gen_velocity, sigma)
+                if is_fake and generator_residency is not None:
+                    fake_offload_stats.update(generator_residency.offload())
+                    fake_offload_stats["real_on_cpu"] = real_residency.on_cpu
+                require_finite(generated, "Generator output", device)
+                score_sigma = schedule.score_sigma(row["height"], row["width"],
+                    float(params["score_sigma_min"]), float(params["score_sigma_max"]), device)
+                score_noise = torch.randn_like(generated)
+                noisy = renoise(generated.detach(), score_noise, score_sigma)
+                if is_fake:
+                    fake_velocity = predict_velocity(fake, noisy, score_sigma, condition)
+                    loss, aux = fake_score_loss(noisy, fake_velocity, generated, score_noise, score_sigma,
+                        max_weight=float(params["fake_max_weight"]), min_alpha=float(params["fake_min_alpha"]),
+                        loss_weight=float(params["fake_loss_weight"]))
+                    tensors["fake_velocity"] = fake_velocity
+                else:
+                    with torch.no_grad():
+                        fake_velocity = predict_velocity(fake, noisy, score_sigma, condition)
+                        real_velocity = predict_velocity(real, noisy, score_sigma, condition)
+                    loss, aux = dmd_surrogate(generated, noisy, fake_velocity, real_velocity, score_sigma,
+                        loss_weight=float(params["generator_loss_weight"]),
+                        normalization_eps=float(params["normalization_eps"]))
+                    tensors.update(fake_velocity=fake_velocity, real_velocity=real_velocity)
+                tensors.update(generator_x0=generated, score_noise=score_noise,
+                               score_noisy_latent=noisy, score_sigma=score_sigma, **aux)
+            require_finite(loss, f"{phase} loss", device)
+            forward_seconds = time.monotonic() - forward_start
+            # Synchronize/reduce each microbatch: avoid no_sync's unsharded-gradient peak.
+            backward_start = time.monotonic()
+            with offload_score_shards(
+                    (fake, real) if phase == "generator" else (),
+                    enabled=phase == "generator" and runtime.get("offload_scores_for_generator_backward", False)
+            ) as offload_stats:
+                (loss / ga).backward()
+                torch.cuda.synchronize(device)
+            backward_seconds = time.monotonic() - backward_start
+            meta = {"phase": phase, "updates_before": before, "ga_index": ga_index, "rank": rank,
+                    "ga": ga, "generator_step_index": step_index, "generator_sigma": sigma.item(),
+                    "generator_sigma_grid": levels.tolist(), "sample_id": row["id"],
+                    "kind": row["kind"], "width": row["width"], "height": row["height"],
+                    "reference_count": len(row["reference_images"]),
+                    "prompt_characters": len(row["prompt"]),
+                    "target_tokens": clean.shape[1], "estimated_sample_tokens": estimated_training_tokens(row),
+                    "img_shapes": condition["img_shapes"],
+                    "vlm_sequence_length": condition["encoder_hidden_states"].shape[1],
+                    "lr": float(spec["lr"]), "loss": loss.detach().item(),
+                    "data_seconds": data_seconds, "forward_seconds": forward_seconds,
+                    "backward_seconds": backward_seconds}
+            meta.update(actual_total_tokens=target_tokens+reference_tokens+text_tokens,
+                        reference_tokens=reference_tokens, text_tokens=text_tokens)
+            if fake_offload_stats:
+                meta["fake_phase_offload"] = fake_offload_stats
+            if offload_stats:
+                meta["score_offload"] = offload_stats
+            if phase != "reflow":
+                meta["score_sigma"] = score_sigma.item()
+            for key in ("epsilon_mse", "weight_raw", "weight", "cap_fraction", "loss_unweighted", "loss_weighted", "denominator"):
+                if key in aux:
+                    meta[key] = scalar(aux[key])
+            meta["tensor_stats"] = {k: tensor_stats(tensors[k]) for k in
+                ("generator_x0", "fake_x0", "real_x0", "diff_x0", "normalized_direction") if k in tensors}
+            micro_logs.append(meta)
+            if rank == 0 and phase == "reflow" and ga > 4 and (ga_index + 1) % 4 == 0:
+                logger.info("REFLOW accumulation update=%d microbatch=%d/%d local_loss=%.6g",
+                            before["reflow_updates"] + 1, ga_index + 1, ga, meta["loss"])
+            if capture:
+                captures.append({"record": copy.deepcopy(row), "metadata": meta,
+                                 "tensors": snapshot_tensors(tensors)})
+            del tensors, loss, aux, condition
+        # All FSDP gradient shards are FP32; detect nonfinite globally before AdamW.
+        local_bad = any(p.grad is not None and not torch.isfinite(p.grad).all() for p in active.parameters())
+        require_finite(torch.tensor(float("nan") if local_bad else 0., device=device), "gradients", device)
+        norm = active.clip_grad_norm_(float(spec["max_grad_norm"]))
+        require_finite(norm, "global gradient norm", device)
+        optimizer.step()
+        state.advance(phase)
+        probe_delta = (probe_param.detach().flatten()[:1024] - probe_before).float()
+        global_loss = torch.tensor(sum(m["loss"] for m in micro_logs) / ga, device=device)
+        dist.all_reduce(global_loss)
+        global_loss /= world
+        hits = torch.tensor(hit_counts, device=device)
+        dist.all_reduce(hits)
+        losses_by_sigma = torch.tensor([
+            sum(m["loss"] for m in micro_logs if m["generator_step_index"] == index)
+            for index in range(6)], device=device)
+        dist.all_reduce(losses_by_sigma)
+        log = {"time": time.time(), "phase": phase, **state.state_dict(), "outer": state.outer,
+               "microbatches": micro_logs, "ga": ga, "effective_samples": ga * world,
+               "global_loss": global_loss.item(), "sigma_hits_global": hits.tolist(),
+               "sigma_loss_mean_global": [losses_by_sigma[i].item() / hits[i].item()
+                                          if hits[i].item() else None for i in range(6)],
+               "grad_norm_before_clip": norm.item(),
+               "grad_norm_after_clip_bound": min(norm.item(), float(spec["max_grad_norm"])),
+               "probe_delta_abs_mean": probe_delta.abs().mean().item() if probe_delta.numel() else 0.,
+               "lr": float(spec["lr"]), "seconds": time.monotonic() - started,
+               "peak_allocated_bytes": torch.cuda.max_memory_allocated(device),
+               "peak_reserved_bytes": torch.cuda.max_memory_reserved(device),
+               "nonfinite_count": 0}
+        def write_log():
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(log, allow_nan=False) + "\n")
+        collective_call("write scalar diagnostics", write_log)
+        if rank == 0:
+            logger.info("Qwen %s reflow=%d fake=%d gen=%d loss=%.6g grad_norm=%.6g",
+                        phase, state.reflow_updates, state.fake_updates, state.generator_updates,
+                        log["global_loss"], log["grad_norm_before_clip"])
+        # Do not keep full gradients resident during validation or next phase loading.
+        optimizer.zero_grad(set_to_none=True)
+        if capture:
+            debug_snapshots[phase] = captures
+        def run_debug():
+            if phase == "generator" and set(debug_snapshots) != {"fake_score", "generator"}:
+                raise RuntimeError("Missing actual GA snapshots for scheduled debug event")
+            debug_event(output, state, generator, {} if phase == "reflow" else debug_snapshots,
+                        evaluation, store, schedule, get_decoder(), device, rank, world,
+                        data.get("reference_root") or dataset.document["reference_root"],
+                        runtime["debug_prompts_csv"], contract,
+                        prompt_count=int(runtime.get("debug_prompt_count", 8)),
+                        comparison_steps=int(runtime.get("debug_comparison_steps", 25)))
+            debug_snapshots.clear()
+        post_update_actions(state, phase, reflow_total, fake_total, runtime, save, run_debug)
+    state.validate(reflow_total, fake_total)
+    if (state.reflow_updates, state.fake_updates, state.generator_updates) != (reflow_total, fake_total, fake_total // 5):
+        raise RuntimeError("Training ended before all required optimizer updates")
+    collective_call("record training completion", lambda: atomic_json(output / "TRAINING_COMPLETE.json", {
+        "updates": state.state_dict(), "checkpoint": str(last_checkpoint or resume), "contract": contract
+    }) if rank == 0 else None)

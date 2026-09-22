@@ -69,6 +69,7 @@ def save_distributed_training_state(
     *,
     step: int,
     extra_state: dict[str, Any] | None = None,
+    save_rng_sidecar: bool = True,
 ) -> None:
     path = Path(path)
     options = StateDictOptions(full_state_dict=False, cpu_offload=True)
@@ -83,7 +84,8 @@ def save_distributed_training_state(
         checkpoint_id=str(path),
     )
     rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-    torch.save(capture_rng_state(), path / f"rng-rank{rank}.pt")
+    if save_rng_sidecar:
+        torch.save(capture_rng_state(), path / f"rng-rank{rank}.pt")
     if extra_state is not None:
         torch.save(extra_state, path / f"extra-rank{rank}.pt")
 
@@ -126,6 +128,7 @@ def load_distributed_training_state(
     *,
     extra_state: dict[str, Any] | None = None,
     allow_partial_optimizer_state: bool = False,
+    restore_rng_sidecar: bool = True,
 ) -> int:
     path = Path(path)
     options = StateDictOptions(full_state_dict=False, cpu_offload=True)
@@ -147,9 +150,10 @@ def load_distributed_training_state(
     )
     rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
     rng_path = path / f"rng-rank{rank}.pt"
-    if not rng_path.is_file():
-        raise FileNotFoundError(f"Distributed RNG sidecar is missing: {rng_path}")
-    restore_rng_state(torch.load(rng_path, map_location="cpu", weights_only=False))
+    if restore_rng_sidecar:
+        if not rng_path.is_file():
+            raise FileNotFoundError(f"Distributed RNG sidecar is missing: {rng_path}")
+        restore_rng_state(torch.load(rng_path, map_location="cpu", weights_only=False))
     if extra_state is not None:
         extra_path = path / f"extra-rank{rank}.pt"
         if not extra_path.is_file():

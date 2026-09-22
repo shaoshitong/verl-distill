@@ -94,6 +94,11 @@ def validate_config(config: dict[str, Any]) -> None:
             raise ValueError(f"{section} must be a mapping")
     if not config["model"].get("pretrained_model"):
         raise ValueError("model.pretrained_model is required")
+    if config["model"].get("family") == "qwen_image21":
+        from verl_distill.models.qwen_image21.configuration import validate_qwen_config
+
+        validate_qwen_config(config)
+        return
     data_format = config["data"].get("format")
     if data_format not in {"image_jsonl", "prompt_jsonl", "image_lance", "lance"}:
         raise ValueError("data.format must be image_jsonl, prompt_jsonl, image_lance, or lance")
