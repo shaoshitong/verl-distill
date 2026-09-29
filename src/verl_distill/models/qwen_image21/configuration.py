@@ -10,6 +10,11 @@ CACHE_SCHEMA = 1
 def validate_qwen_config(config):
     model, data, runtime = (config[k] for k in ("model", "data", "runtime"))
     params = config["method"]["params"]
+    rollout_loss_mode = params.get("dmd_rollout_loss_mode", "random_exit")
+    if rollout_loss_mode not in ("random_exit", "all_exits"):
+        raise ValueError("dmd_rollout_loss_mode must be random_exit or all_exits")
+    if rollout_loss_mode == "all_exits" and params.get("generator_input") != "rollout_dataset_noise":
+        raise ValueError("all_exits requires generator_input=rollout_dataset_noise")
     if type(runtime.get("debug_force_last_exit", False)) is not bool:
         raise ValueError("debug_force_last_exit must be boolean")
     if runtime.get("debug_force_last_exit", False) and params.get("generator_input") != "rollout_dataset_noise":

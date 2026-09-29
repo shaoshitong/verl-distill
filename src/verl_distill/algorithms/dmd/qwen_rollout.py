@@ -22,3 +22,18 @@ def detached_prefix_rollout(initial_noise, levels, exit_index, predict, *, train
         velocity = predict(exit_input, sigma)
         generated = exit_input - sigma * velocity.float()
     return generated, exit_input
+
+
+def detached_rollout_step(x, levels, step_index, predict, *, train_exit):
+    """One shared trajectory step; next state never retains the exit graph."""
+    if not 0 <= step_index < len(levels) - 1:
+        raise ValueError("Step must select a nonzero rollout timestep")
+    exit_input = x.detach().float()
+    sigma = levels[step_index:step_index + 1]
+    with torch.set_grad_enabled(train_exit):
+        velocity = predict(exit_input, sigma)
+        generated = exit_input - sigma * velocity.float()
+    with torch.no_grad():
+        next_input = (exit_input + (levels[step_index + 1] - levels[step_index])
+                      * velocity.float()).detach()
+    return generated, exit_input, next_input

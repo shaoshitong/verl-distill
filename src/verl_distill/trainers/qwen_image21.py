@@ -714,6 +714,8 @@ def _train_with_writer(config, context, writer):
             if phase == "reflow"
             else runtime["gradient_accumulation_steps"]
         )
+        all_exits = phase != "reflow" and params.get("dmd_rollout_loss_mode", "random_exit") == "all_exits"
+        exits_per_sample = 6 if all_exits else 1
         is_fake = phase == "fake_score"
         active = fake if is_fake else generator
         optimizer = fake_optimizer if is_fake else gen_optimizer
@@ -773,243 +775,262 @@ def _train_with_writer(config, context, writer):
                 exit_draw.fill_(bench["exit_index"])
             forced_debug_exit = force_debug_exit(capture,
                 runtime.get("debug_force_last_exit", False), rollout_input)
+            if all_exits:
+                forced_debug_exit = False
             if forced_debug_exit:
                 exit_draw.fill_(len(levels) - 2)
             if rollout_input:
                 # FSDP all-gathers must have the same forward-call count on all ranks.
                 dist.broadcast(exit_draw, src=0)
             step_index = int(exit_draw.item())
-            hit_counts[step_index] += 1
             sigma = levels[step_index : step_index + 1]
             noise = item["noise"].to(device) if phase == "reflow" or rollout_input else torch.randn_like(clean)
             gen_input = None if rollout_input else renoise(clean, noise, sigma)
             data_seconds = time.monotonic() - fetched
-            forward_start = time.monotonic()
-            tensors = {
-                "generator_input": gen_input,
-                "generator_input_noise": noise,
-                "generator_sigma": sigma,
-            }
-            fake_offload_stats = {}
-            if phase == "reflow" and feature_reflow:
-                generated, gen_input = detached_prefix_rollout(
-                    noise, levels, step_index,
-                    lambda x, t: predict_velocity(generator, x, t, condition), train_exit=True,
-                )
-                score_sigma = schedule.score_sigma(row["height"], row["width"],
-                    float(params["score_sigma_min"]), float(params["score_sigma_max"]), device)
-                with torch.no_grad():
-                    target_features = predict_features(feature_teacher, renoise(clean, noise, score_sigma), score_sigma, condition)
-                predicted_features = predict_features(feature_teacher, renoise(generated, noise, score_sigma), score_sigma, condition)
-                loss = feature_cosine_loss(predicted_features, target_features)
-                tensors.update(generator_input=gen_input, generator_x0=generated, score_sigma=score_sigma)
-                aux = {}
-                del predicted_features, target_features
-            elif phase == "reflow":
-                velocity = predict_velocity(generator, gen_input, sigma, condition)
-                loss = reflow_loss(velocity, clean, noise)
-                tensors.update(
-                    generator_x0=x0_from_velocity(gen_input, velocity, sigma),
-                    reflow_target_flow=noise - clean,
-                    predicted_velocity=velocity,
-                )
-                aux = {}
-            else:
-                if is_fake and generator_residency is not None:
-                    fake_offload_stats["generator_reload_seconds"] = generator_residency.load()
-                if rollout_input:
+            rollout_state = noise.detach().float() if all_exits else None
+            exit_indices = range(len(levels) - 1) if all_exits else (step_index,)
+            if all_exits and len(levels) - 1 != exits_per_sample:
+                raise ValueError("all_exits currently requires the six-step schedule")
+            for step_index in exit_indices:
+                hit_counts[step_index] += 1
+                sigma = levels[step_index:step_index + 1]
+                forward_start = time.monotonic()
+                tensors = {
+                    "generator_input": gen_input,
+                    "generator_input_noise": noise,
+                    "generator_sigma": sigma,
+                }
+                fake_offload_stats = {}
+                if phase == "reflow" and feature_reflow:
                     generated, gen_input = detached_prefix_rollout(
                         noise, levels, step_index,
-                        lambda x, t: predict_velocity(generator, x, t, condition),
-                        train_exit=not is_fake,
+                        lambda x, t: predict_velocity(generator, x, t, condition), train_exit=True,
                     )
-                    tensors["generator_input"] = gen_input
-                else:
-                    with torch.set_grad_enabled(not is_fake):
-                        gen_velocity = predict_velocity(generator, gen_input, sigma, condition)
-                        generated = x0_from_velocity(gen_input, gen_velocity, sigma)
-                if is_fake and generator_residency is not None:
-                    fake_offload_stats.update(generator_residency.offload())
-                    fake_offload_stats["real_on_cpu"] = real_residency.on_cpu
-                require_finite(generated, "Generator output", device)
-                score_sigma = schedule.score_sigma(
-                    row["height"],
-                    row["width"],
-                    float(params["score_sigma_min"]),
-                    float(params["score_sigma_max"]),
-                    device,
-                )
-                score_noise = torch.randn_like(generated)
-                noisy = renoise(generated.detach(), score_noise, score_sigma)
-                if is_fake:
-                    fake_velocity = predict_fake_cfg(fake, noisy, score_sigma, condition, scale=fake_cfg)
-                    loss, aux = fake_score_loss(
-                        noisy,
-                        fake_velocity,
-                        generated,
-                        score_noise,
-                        score_sigma,
-                        max_weight=float(params["fake_max_weight"]),
-                        min_alpha=float(params["fake_min_alpha"]),
-                        loss_weight=float(params["fake_loss_weight"]),
-                        loss_mode=params["fake_loss"],
-                    )
-                    tensors["fake_velocity"] = fake_velocity
-                else:
+                    score_sigma = schedule.score_sigma(row["height"], row["width"],
+                        float(params["score_sigma_min"]), float(params["score_sigma_max"]), device)
                     with torch.no_grad():
-                        fake_velocity = predict_fake_cfg(fake, noisy, score_sigma, condition, scale=fake_cfg)
-                        conditional_real = predict_velocity(real, noisy, score_sigma, condition)
-                        if teacher_cfg > 1:
-                            negative_condition = collective_call(
-                                "load Teacher negative condition",
-                                lambda: negative_store.get(row, condition, device),
-                            )
-                            negative_real = predict_velocity(
-                                real, noisy, score_sigma, negative_condition
-                            )
-                            real_velocity = combine_cfg(
-                                conditional_real, negative_real, teacher_cfg
-                            )
-                            tensors.update(
-                                real_conditional_velocity=conditional_real,
-                                real_negative_velocity=negative_real,
-                            )
-                            del negative_condition
-                        else:
-                            real_velocity = conditional_real
-                    loss, aux = dmd_surrogate(
-                        generated,
-                        noisy,
-                        fake_velocity,
-                        real_velocity,
-                        score_sigma,
-                        loss_weight=float(params["generator_loss_weight"]),
-                        normalization_eps=float(params["normalization_eps"]),
-                        dtype=params.get("dmd_surrogate_dtype", "float64"),
+                        target_features = predict_features(feature_teacher, renoise(clean, noise, score_sigma), score_sigma, condition)
+                    predicted_features = predict_features(feature_teacher, renoise(generated, noise, score_sigma), score_sigma, condition)
+                    loss = feature_cosine_loss(predicted_features, target_features)
+                    tensors.update(generator_input=gen_input, generator_x0=generated, score_sigma=score_sigma)
+                    aux = {}
+                    del predicted_features, target_features
+                elif phase == "reflow":
+                    velocity = predict_velocity(generator, gen_input, sigma, condition)
+                    loss = reflow_loss(velocity, clean, noise)
+                    tensors.update(
+                        generator_x0=x0_from_velocity(gen_input, velocity, sigma),
+                        reflow_target_flow=noise - clean,
+                        predicted_velocity=velocity,
                     )
-                    tensors.update(fake_velocity=fake_velocity, real_velocity=real_velocity)
-                tensors.update(
-                    generator_x0=generated,
-                    score_noise=score_noise,
-                    score_noisy_latent=noisy,
-                    score_sigma=score_sigma,
-                    **aux,
+                    aux = {}
+                else:
+                    if is_fake and generator_residency is not None and (not all_exits or step_index == 0):
+                        fake_offload_stats["generator_reload_seconds"] = generator_residency.load()
+                    if all_exits:
+                        from verl_distill.algorithms.dmd.qwen_rollout import detached_rollout_step
+                        generated, gen_input, rollout_state = detached_rollout_step(
+                            rollout_state, levels, step_index,
+                            lambda x, t: predict_velocity(generator, x, t, condition),
+                            train_exit=not is_fake,
+                        )
+                        tensors["generator_input"] = gen_input
+                    elif rollout_input:
+                        generated, gen_input = detached_prefix_rollout(
+                            noise, levels, step_index,
+                            lambda x, t: predict_velocity(generator, x, t, condition),
+                            train_exit=not is_fake,
+                        )
+                        tensors["generator_input"] = gen_input
+                    else:
+                        with torch.set_grad_enabled(not is_fake):
+                            gen_velocity = predict_velocity(generator, gen_input, sigma, condition)
+                            generated = x0_from_velocity(gen_input, gen_velocity, sigma)
+                    if is_fake and generator_residency is not None and (not all_exits or step_index == len(levels) - 2):
+                        fake_offload_stats.update(generator_residency.offload())
+                        fake_offload_stats["real_on_cpu"] = real_residency.on_cpu
+                    require_finite(generated, "Generator output", device)
+                    score_sigma = schedule.score_sigma(
+                        row["height"],
+                        row["width"],
+                        float(params["score_sigma_min"]),
+                        float(params["score_sigma_max"]),
+                        device,
+                    )
+                    score_noise = torch.randn_like(generated)
+                    noisy = renoise(generated.detach(), score_noise, score_sigma)
+                    if is_fake:
+                        fake_velocity = predict_fake_cfg(fake, noisy, score_sigma, condition, scale=fake_cfg)
+                        loss, aux = fake_score_loss(
+                            noisy,
+                            fake_velocity,
+                            generated,
+                            score_noise,
+                            score_sigma,
+                            max_weight=float(params["fake_max_weight"]),
+                            min_alpha=float(params["fake_min_alpha"]),
+                            loss_weight=float(params["fake_loss_weight"]),
+                            loss_mode=params["fake_loss"],
+                        )
+                        tensors["fake_velocity"] = fake_velocity
+                    else:
+                        with torch.no_grad():
+                            fake_velocity = predict_fake_cfg(fake, noisy, score_sigma, condition, scale=fake_cfg)
+                            conditional_real = predict_velocity(real, noisy, score_sigma, condition)
+                            if teacher_cfg > 1:
+                                negative_condition = collective_call(
+                                    "load Teacher negative condition",
+                                    lambda: negative_store.get(row, condition, device),
+                                )
+                                negative_real = predict_velocity(
+                                    real, noisy, score_sigma, negative_condition
+                                )
+                                real_velocity = combine_cfg(
+                                    conditional_real, negative_real, teacher_cfg
+                                )
+                                tensors.update(
+                                    real_conditional_velocity=conditional_real,
+                                    real_negative_velocity=negative_real,
+                                )
+                                del negative_condition
+                            else:
+                                real_velocity = conditional_real
+                        loss, aux = dmd_surrogate(
+                            generated,
+                            noisy,
+                            fake_velocity,
+                            real_velocity,
+                            score_sigma,
+                            loss_weight=float(params["generator_loss_weight"]),
+                            normalization_eps=float(params["normalization_eps"]),
+                            dtype=params.get("dmd_surrogate_dtype", "float64"),
+                        )
+                        tensors.update(fake_velocity=fake_velocity, real_velocity=real_velocity)
+                    tensors.update(
+                        generator_x0=generated,
+                        score_noise=score_noise,
+                        score_noisy_latent=noisy,
+                        score_sigma=score_sigma,
+                        **aux,
+                    )
+                require_finite(loss, f"{phase} loss", device)
+                forward_seconds = time.monotonic() - forward_start
+                # Synchronize/reduce each microbatch: avoid no_sync's unsharded-gradient peak.
+                backward_start = time.monotonic()
+                with offload_score_shards(
+                    (fake, real) if phase == "generator" else (),
+                    enabled=phase == "generator"
+                    and runtime.get("offload_scores_for_generator_backward", False),
+                ) as offload_stats:
+                    (loss / (ga * exits_per_sample)).backward()
+                    torch.cuda.synchronize(device)
+                backward_seconds = time.monotonic() - backward_start
+                if phase == "reflow" and feature_reflow:
+                    if any(p.requires_grad or p.grad is not None for p in feature_teacher.parameters()):
+                        raise RuntimeError("Frozen feature teacher unexpectedly acquired parameter gradients")
+                meta = {
+                    "phase": phase,
+                    "updates_before": before,
+                    "ga_index": ga_index,
+                    "rank": rank,
+                    "ga": ga,
+                    "generator_step_index": step_index,
+                    "forced_debug_exit": forced_debug_exit,
+                    "dmd_rollout_loss_mode": "all_exits" if all_exits else "random_exit",
+                    "loss_accumulation_divisor": ga * exits_per_sample,
+                    "generator_sigma": sigma.item(),
+                    "generator_sigma_grid": levels.tolist(),
+                    "sample_id": row["id"],
+                    "kind": row["kind"],
+                    "width": row["width"],
+                    "height": row["height"],
+                    "reference_count": len(row["reference_images"]),
+                    "prompt_characters": len(row["prompt"]),
+                    "target_tokens": clean.shape[1],
+                    "estimated_sample_tokens": estimated_training_tokens(row),
+                    "img_shapes": condition["img_shapes"],
+                    "vlm_sequence_length": condition["encoder_hidden_states"].shape[1],
+                    "lr": float(spec["lr"]),
+                    "loss": loss.detach().item(),
+                    "data_seconds": data_seconds if not all_exits or step_index == 0 else 0.0,
+                    "forward_seconds": forward_seconds,
+                    "backward_seconds": backward_seconds,
+                }
+                if phase in ("fake_score", "generator"):
+                    meta["fake_score_forward_branches"] = 1
+                    meta["real_score_forward_branches"] = (2 if teacher_cfg > 1 else 1) if phase == "generator" else 0
+                    meta["fake_guidance"] = "conditional_only"
+                if phase == "generator":
+                    meta["fake_cfg_scale"] = fake_cfg
+                    meta["teacher_cfg_scale"] = teacher_cfg
+                    meta["teacher_negative_prompt"] = "" if teacher_cfg > 1 else None
+                    meta["teacher_reference_images_preserved"] = teacher_cfg > 1
+                meta.update(
+                    actual_total_tokens=target_tokens + reference_tokens + text_tokens,
+                    reference_tokens=reference_tokens,
+                    text_tokens=text_tokens,
                 )
-            require_finite(loss, f"{phase} loss", device)
-            forward_seconds = time.monotonic() - forward_start
-            # Synchronize/reduce each microbatch: avoid no_sync's unsharded-gradient peak.
-            backward_start = time.monotonic()
-            with offload_score_shards(
-                (fake, real) if phase == "generator" else (),
-                enabled=phase == "generator"
-                and runtime.get("offload_scores_for_generator_backward", False),
-            ) as offload_stats:
-                (loss / ga).backward()
-                torch.cuda.synchronize(device)
-            backward_seconds = time.monotonic() - backward_start
-            if phase == "reflow" and feature_reflow:
-                if any(p.requires_grad or p.grad is not None for p in feature_teacher.parameters()):
-                    raise RuntimeError("Frozen feature teacher unexpectedly acquired parameter gradients")
-            meta = {
-                "phase": phase,
-                "updates_before": before,
-                "ga_index": ga_index,
-                "rank": rank,
-                "ga": ga,
-                "generator_step_index": step_index,
-                "forced_debug_exit": forced_debug_exit,
-                "generator_sigma": sigma.item(),
-                "generator_sigma_grid": levels.tolist(),
-                "sample_id": row["id"],
-                "kind": row["kind"],
-                "width": row["width"],
-                "height": row["height"],
-                "reference_count": len(row["reference_images"]),
-                "prompt_characters": len(row["prompt"]),
-                "target_tokens": clean.shape[1],
-                "estimated_sample_tokens": estimated_training_tokens(row),
-                "img_shapes": condition["img_shapes"],
-                "vlm_sequence_length": condition["encoder_hidden_states"].shape[1],
-                "lr": float(spec["lr"]),
-                "loss": loss.detach().item(),
-                "data_seconds": data_seconds,
-                "forward_seconds": forward_seconds,
-                "backward_seconds": backward_seconds,
-            }
-            if phase in ("fake_score", "generator"):
-                meta["fake_score_forward_branches"] = 1
-                meta["real_score_forward_branches"] = (2 if teacher_cfg > 1 else 1) if phase == "generator" else 0
-                meta["fake_guidance"] = "conditional_only"
-            if phase == "generator":
-                meta["fake_cfg_scale"] = fake_cfg
-                meta["teacher_cfg_scale"] = teacher_cfg
-                meta["teacher_negative_prompt"] = "" if teacher_cfg > 1 else None
-                meta["teacher_reference_images_preserved"] = teacher_cfg > 1
-            meta.update(
-                actual_total_tokens=target_tokens + reference_tokens + text_tokens,
-                reference_tokens=reference_tokens,
-                text_tokens=text_tokens,
-            )
-            if phase == "reflow" and feature_reflow:
-                meta.update(reflow_loss="tdm_feature_cosine", initial_noise_source="dataset",
-                    generator_nfe=step_index + 1, prefix_detached=True,
-                    rollout_path=levels[:step_index + 1].tolist() + [0.0],
-                    score_sigma=score_sigma.item(), score_flow_shift=params["score_flow_shift"],
-                    feature_noise_source="dataset", feature_layer="last_transformer_block_pre_norm_proj_unpatch",
-                    feature_reduction="channel_cosine_mean_target_tokens", real_frozen=True)
-            if fake_offload_stats:
-                meta["fake_phase_offload"] = fake_offload_stats
-            if offload_stats:
-                meta["score_offload"] = offload_stats
-            if phase != "reflow":
-                meta["generator_input_mode"] = params["generator_input"]
-                meta["initial_noise_source"] = "dataset" if rollout_input else "fresh_gaussian"
-                meta["generator_nfe"] = step_index + 1 if rollout_input else 1
-                meta["prefix_detached"] = rollout_input
-                meta["rollout_path"] = levels[:step_index + 1].tolist() + [0.0] if rollout_input else None
-                meta["score_flow_shift"] = params.get("score_flow_shift", "dynamic")
-                meta["score_sigma"] = score_sigma.item()
-            for key in (
-                "epsilon_mse",
-                "velocity_mse",
-                "x0_mse",
-                "velocity_weight",
-                "weight_raw",
-                "weight",
-                "cap_fraction",
-                "loss_unweighted",
-                "loss_weighted",
-                "denominator",
-            ):
-                if key in aux:
-                    meta[key] = scalar(aux[key])
-            meta["tensor_stats"] = {
-                k: tensor_stats(tensors[k])
-                for k in ("generator_x0", "fake_x0", "real_x0", "diff_x0", "normalized_direction")
-                if k in tensors
-            }
-            if "normalized_direction" in tensors:
-                meta["direction_rms"] = (
-                    tensors["normalized_direction"].detach().square().mean().sqrt().item()
-                )
-            micro_logs.append(meta)
-            if rank == 0 and phase == "reflow" and ga > 4 and (ga_index + 1) % 4 == 0:
-                logger.info(
-                    "REFLOW accumulation update=%d microbatch=%d/%d local_loss=%.6g",
-                    before["reflow_updates"] + 1,
-                    ga_index + 1,
-                    ga,
-                    meta["loss"],
-                )
-            if capture:
-                captures.append(
-                    {
-                        "record": copy.deepcopy(row),
-                        "metadata": meta,
-                        "tensors": snapshot_tensors(tensors),
-                    }
-                )
-            del tensors, loss, aux, condition
+                if phase == "reflow" and feature_reflow:
+                    meta.update(reflow_loss="tdm_feature_cosine", initial_noise_source="dataset",
+                        generator_nfe=step_index + 1, prefix_detached=True,
+                        rollout_path=levels[:step_index + 1].tolist() + [0.0],
+                        score_sigma=score_sigma.item(), score_flow_shift=params["score_flow_shift"],
+                        feature_noise_source="dataset", feature_layer="last_transformer_block_pre_norm_proj_unpatch",
+                        feature_reduction="channel_cosine_mean_target_tokens", real_frozen=True)
+                if fake_offload_stats:
+                    meta["fake_phase_offload"] = fake_offload_stats
+                if offload_stats:
+                    meta["score_offload"] = offload_stats
+                if phase != "reflow":
+                    meta["generator_input_mode"] = params["generator_input"]
+                    meta["initial_noise_source"] = "dataset" if rollout_input else "fresh_gaussian"
+                    meta["generator_nfe"] = step_index + 1 if rollout_input else 1
+                    meta["prefix_detached"] = rollout_input
+                    meta["rollout_path"] = levels[:step_index + 1].tolist() + [0.0] if rollout_input else None
+                    meta["score_flow_shift"] = params.get("score_flow_shift", "dynamic")
+                    meta["score_sigma"] = score_sigma.item()
+                for key in (
+                    "epsilon_mse",
+                    "velocity_mse",
+                    "x0_mse",
+                    "velocity_weight",
+                    "weight_raw",
+                    "weight",
+                    "cap_fraction",
+                    "loss_unweighted",
+                    "loss_weighted",
+                    "denominator",
+                ):
+                    if key in aux:
+                        meta[key] = scalar(aux[key])
+                meta["tensor_stats"] = {
+                    k: tensor_stats(tensors[k])
+                    for k in ("generator_x0", "fake_x0", "real_x0", "diff_x0", "normalized_direction")
+                    if k in tensors
+                }
+                if "normalized_direction" in tensors:
+                    meta["direction_rms"] = (
+                        tensors["normalized_direction"].detach().square().mean().sqrt().item()
+                    )
+                micro_logs.append(meta)
+                if rank == 0 and phase == "reflow" and ga > 4 and (ga_index + 1) % 4 == 0:
+                    logger.info(
+                        "REFLOW accumulation update=%d microbatch=%d/%d local_loss=%.6g",
+                        before["reflow_updates"] + 1,
+                        ga_index + 1,
+                        ga,
+                        meta["loss"],
+                    )
+                if capture and (not all_exits or step_index == len(levels) - 2):
+                    captures.append(
+                        {
+                            "record": copy.deepcopy(row),
+                            "metadata": meta,
+                            "tensors": snapshot_tensors(tensors),
+                        }
+                    )
+                del tensors, loss, aux
+            del condition
         # All FSDP gradient shards are FP32; detect nonfinite globally before AdamW.
         local_bad = any(
             p.grad is not None and not torch.isfinite(p.grad).all() for p in active.parameters()
@@ -1022,7 +1043,7 @@ def _train_with_writer(config, context, writer):
         optimizer.step()
         state.advance(phase)
         probe_delta = (probe_param.detach().flatten()[:1024] - probe_before).float()
-        global_loss = torch.tensor(sum(m["loss"] for m in micro_logs) / ga, device=device)
+        global_loss = torch.tensor(sum(m["loss"] for m in micro_logs) / (ga * exits_per_sample), device=device)
         dist.all_reduce(global_loss)
         global_loss /= world
         hits = torch.tensor(hit_counts, device=device)
