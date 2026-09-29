@@ -45,9 +45,10 @@ def within(root, relative):
 def validate_complete(path, output_root, reference_root, *, verify_hash=True):
     path = Path(path)
     meta = json.loads(path.read_text())
-    required = {"model_revision": MODEL_REVISION, "num_inference_steps": 40,
-                "true_cfg_scale": 1.0, "vae_tiling": False,
+    required = {"num_inference_steps": 40, "true_cfg_scale": 1.0, "vae_tiling": False,
                 "model_cpu_offload": True, "use_kv_cache": True}
+    if MODEL_REVISION:
+        required["model_revision"] = MODEL_REVISION
     for key, expected in required.items():
         if meta.get(key) != expected:
             raise ValueError(f"{path}: {key} != {expected}")

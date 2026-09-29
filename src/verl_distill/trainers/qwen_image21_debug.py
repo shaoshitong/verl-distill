@@ -1,16 +1,20 @@
 """Detailed production-independent DMD diagnostics and 64-prompt six-call evaluation."""
+
 from __future__ import annotations
 
-from pathlib import Path
 import logging
+from pathlib import Path
 
-import numpy as np
 import torch
 import torch.distributed as dist
 from PIL import Image, ImageDraw
 
 from verl_distill.data.qwen_image21 import atomic_json, sha256, within
-from verl_distill.engine.qwen_checkpoint import capture_rng_state, restore_rng_state, collective_call
+from verl_distill.engine.qwen_checkpoint import (
+    capture_rng_state,
+    collective_call,
+    restore_rng_state,
+)
 from verl_distill.models.qwen_image21.modeling import predict_velocity
 
 logger = logging.getLogger(__name__)
@@ -23,18 +27,26 @@ def debug_event_name(state):
 
 
 def tensor_stats(value):
-    value = value.detach().float()
+    original_dtype = str(value.dtype)
+    value = value.detach().to(torch.float64)
     finite = torch.isfinite(value)
     if not bool(finite.all()):
         raise FloatingPointError("Nonfinite diagnostic tensor")
-    return {"shape": list(value.shape), "dtype": str(value.dtype),
-            "mean": value.mean().item(), "std": value.std(unbiased=False).item(),
-            "min": value.min().item(), "max": value.max().item(),
-            "l2": value.norm().item(), "finite_fraction": finite.float().mean().item()}
+    return {
+        "shape": list(value.shape),
+        "dtype": original_dtype,
+        "statistics_dtype": str(value.dtype),
+        "mean": value.mean().item(),
+        "std": value.std(unbiased=False).item(),
+        "min": value.min().item(),
+        "max": value.max().item(),
+        "l2": value.norm().item(),
+        "finite_fraction": finite.double().mean().item(),
+    }
 
 
 def cosine(a, b):
-    a, b = a.detach().float().flatten(), b.detach().float().flatten()
+    a, b = a.detach().double().flatten(), b.detach().double().flatten()
     denom = a.norm() * b.norm()
     return (a.dot(b) / denom).item() if denom > 0 else None
 
@@ -55,13 +67,28 @@ def labeled_grid(items, path, *, cell=384):
 
 
 def heatmap(value, path, scale):
-    # Fixed scale across all events. Actual extrema and clipping are recorded separately.
-    x = value.detach().float().abs().clamp(0, scale).div(scale).cpu().numpy()
-    colors = np.stack([x, np.zeros_like(x), 1 - x], axis=-1)
-    Image.fromarray((colors * 255).astype(np.uint8)).save(path)
+    """Latent direction magnitude, with the same fixed scale across events."""
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    fig = Figure(figsize=(6, 6), layout="constrained")
+    FigureCanvasAgg(fig)
+    ax = fig.subplots()
+    plotted = ax.imshow(
+        value.detach().float().cpu().numpy(),
+        cmap="magma",
+        vmin=0,
+        vmax=scale,
+        interpolation="nearest",
+    )
+    ax.set_title("mean |direction| over latent channels")
+    ax.set_axis_off()
+    fig.colorbar(plotted, ax=ax, shrink=0.8, label="Latent magnitude")
+    fig.savefig(path, dpi=150)
+    fig.clear()
 
 
-def save_train_sample(directory, snapshot, decoder, reference_root, *, diff_scale=1.):
+def save_train_sample(directory, snapshot, decoder, reference_root, *, diff_scale=1.0):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=False)
     record, tensors = snapshot["record"], snapshot["tensors"]
@@ -77,32 +104,45 @@ def save_train_sample(directory, snapshot, decoder, reference_root, *, diff_scal
             image.save(directory / f"{name}.png")
             images[name], pixels[name] = image, pixel
     if "diff_x0" in tensors:
-        diff = tensors["diff_x0"].float()
+        diff = tensors["diff_x0"]
         absolute = diff.abs()
         torch.save(absolute, directory / "abs_diff_x0.pt")
-        spatial = absolute.mean(-1).reshape(record["height"] // 16, record["width"] // 16)
-        heatmap(spatial, directory / "latent_diff_heatmap.png", diff_scale)
+        direction = tensors["normalized_direction"]
+        spatial = direction.abs().mean(-1).reshape(record["height"] // 16, record["width"] // 16)
+        torch.save(spatial, directory / "direction_mean_abs.pt")
+        heatmap(spatial, directory / "direction_mean_abs_heatmap.png", diff_scale)
         pixel_diff = pixels["fake_x0"] - pixels["real_x0"]
         torch.save(pixel_diff, directory / "pixel_diff.pt")
-        pixel_heat = pixel_diff.abs().mean(1)[0]
-        heatmap(pixel_heat, directory / "pixel_diff_heatmap.png", 2.)
         stats["difference"] = {
-            "mae": absolute.mean().item(), "rmse": diff.square().mean().sqrt().item(),
-            "l2": diff.norm().item(), "max": absolute.max().item(),
+            "mae": absolute.mean().item(),
+            "rmse": diff.square().mean().sqrt().item(),
+            "l2": diff.norm().item(),
+            "max": absolute.max().item(),
             "cosine_fake_real": cosine(tensors["fake_x0"], tensors["real_x0"]),
-            "fake_target_mse": (tensors["fake_x0"] - tensors["generator_x0"]).square().mean().item(),
-            "real_target_mse": (tensors["real_x0"] - tensors["generator_x0"]).square().mean().item(),
-            "latent_heatmap_scale": diff_scale,
-            "latent_heatmap_clipped_fraction": (spatial > diff_scale).float().mean().item(),
-            "pixel_heatmap_scale": 2., "pixel_difference_space": "raw VAE pixels (normally [-1,1])"}
+            "fake_target_mse": (tensors["fake_x0"] - tensors["generator_x0"])
+            .square()
+            .mean()
+            .item(),
+            "real_target_mse": (tensors["real_x0"] - tensors["generator_x0"])
+            .square()
+            .mean()
+            .item(),
+            "direction_heatmap_scale": diff_scale,
+            "direction_heatmap_clipped_fraction": (spatial > diff_scale).float().mean().item(),
+            "direction_heatmap_max": spatial.max().item(),
+            "normalization_gain": tensors["denominator"].reciprocal().mean().item(),
+            "pixel_difference_space": "raw VAE pixels (normally [-1,1])",
+        }
     refs = []
     for index, name in enumerate(record["reference_images"]):
         reference_path = within(reference_root, name)
         if sha256(reference_path) != record["reference_sha256"][index]:
             raise ValueError(f"Debug reference image changed: {reference_path}")
         with Image.open(reference_path) as image:
-            refs.append((image.convert("RGB"), f"reference {index+1}"))
-    labeled_grid(refs + [(image, name) for name, image in images.items()], directory / "comparison.png")
+            refs.append((image.convert("RGB"), f"reference {index + 1}"))
+    labeled_grid(
+        refs + [(image, name) for name, image in images.items()], directory / "comparison.png"
+    )
     for image, _ in refs:
         image.close()
     for image in images.values():
@@ -110,23 +150,46 @@ def save_train_sample(directory, snapshot, decoder, reference_root, *, diff_scal
     for path in directory.iterdir():
         if path.is_file():
             files[path.name] = sha256(path)
-    atomic_json(directory / "metadata.json", {**snapshot["metadata"], "record": record,
-                "tensor_stats": stats, "sha256": files,
-                "latent_layout": "B,target_tokens,64 (diffusion-normalized)",
-                "diff_definition": "fake_x0-real_x0; images subtracted AFTER separate VAE decoding"})
+    atomic_json(
+        directory / "metadata.json",
+        {
+            **snapshot["metadata"],
+            "record": record,
+            "tensor_stats": stats,
+            "sha256": files,
+            "latent_layout": "B,target_tokens,64 (diffusion-normalized)",
+            "diff_definition": "fake_x0-real_x0; images subtracted AFTER separate VAE decoding",
+        },
+    )
 
 
 @torch.no_grad()
-def rollout_sample(model, condition, record, schedule, device, *, steps=6,
-                   official_schedule=False, capture_trajectory=True):
-    levels = (schedule.levels(record["height"], record["width"], device=device)
-              if steps == 6 and not official_schedule else
-              schedule.levels(record["height"], record["width"], steps,
-                              generator=not official_schedule, device=device))
+def rollout_sample(
+    model,
+    condition,
+    record,
+    schedule,
+    device,
+    *,
+    steps=6,
+    official_schedule=False,
+    capture_trajectory=True,
+):
+    levels = (
+        schedule.levels(record["height"], record["width"], device=device)
+        if steps == 6 and not official_schedule
+        else schedule.levels(
+            record["height"], record["width"], steps, generator=not official_schedule, device=device
+        )
+    )
     rng = torch.Generator(device).manual_seed(record["seed"])
     # Generate in BF16 as in the validated production pipeline; integrate in FP32.
-    spatial = torch.randn((1, 1, 64, record["height"] // 16, record["width"] // 16),
-                          generator=rng, device=device, dtype=torch.bfloat16)
+    spatial = torch.randn(
+        (1, 1, 64, record["height"] // 16, record["width"] // 16),
+        generator=rng,
+        device=device,
+        dtype=torch.bfloat16,
+    )
     x = spatial.reshape(1, 64, -1).transpose(1, 2).float()
     initial = x.detach().cpu().clone()
     trajectory = []
@@ -160,7 +223,7 @@ def save_rollout(directory, record, result, decoder, metadata):
             stat[name] = tensor_stats(step[name])
         image, _ = decoder.decode(step["predicted_x0"], record["height"], record["width"])
         image.save(step_dir / "predicted_x0.png")
-        previews.append((image, f"step {step['index']+1} sigma={step['sigma']:.4f}"))
+        previews.append((image, f"step {step['index'] + 1} sigma={step['sigma']:.4f}"))
         statistics.append(stat)
     image, _ = decoder.decode(final, record["height"], record["width"])
     image.save(directory / "image.png")
@@ -170,15 +233,40 @@ def save_rollout(directory, record, result, decoder, metadata):
     for preview, _ in previews:
         preview.close()
     files = {str(p.relative_to(directory)): sha256(p) for p in directory.rglob("*") if p.is_file()}
-    atomic_json(directory / "metadata.json", {**metadata, "record": record, "steps": statistics,
-                "initial_noise": tensor_stats(initial), "final_x0": tensor_stats(final),
-                "nfe": len(trajectory), "cfg": "conditional_only", "kv_cache": False,
-                "sha256": files})
+    atomic_json(
+        directory / "metadata.json",
+        {
+            **metadata,
+            "record": record,
+            "steps": statistics,
+            "initial_noise": tensor_stats(initial),
+            "final_x0": tensor_stats(final),
+            "nfe": len(trajectory),
+            "cfg": "conditional_only",
+            "kv_cache": False,
+            "sha256": files,
+        },
+    )
 
 
-def debug_event(output, state, model, snapshots, evaluation, store, schedule, decoder,
-                device, rank, world_size, reference_root, prompts_csv, contract,
-                prompt_count=64, comparison_steps=0):
+def debug_event(
+    output,
+    state,
+    model,
+    snapshots,
+    evaluation,
+    store,
+    schedule,
+    decoder,
+    device,
+    rank,
+    world_size,
+    reference_root,
+    prompts_csv,
+    contract,
+    prompt_count=64,
+    comparison_steps=0,
+):
     """Every rank enters every evaluation round, including deterministic padding rounds."""
     import time
 
@@ -190,22 +278,40 @@ def debug_event(output, state, model, snapshots, evaluation, store, schedule, de
     was_training = model.training
     started = time.monotonic()
     try:
+
         def reserve():
             if rank == 0:
                 event.mkdir(parents=True, exist_ok=False)
                 (event / "prompts_snapshot.csv").write_bytes(Path(prompts_csv).read_bytes())
-                atomic_json(event / "event.json", {"rollout_updates": state.state_dict(),
-                    "contract": contract, "generator_terminal": .4,
-                    "prompt_ids": [r["id"] for r in rows],
-                    "comparison_steps": comparison_steps, "cfg": "conditional_only",
-                    "training_snapshots": "actual pre-optimizer forward tensors",
-                    "created_at": time.time()})
+                atomic_json(
+                    event / "event.json",
+                    {
+                        "rollout_updates": state.state_dict(),
+                        "contract": contract,
+                        "generator_terminal": 0.4,
+                        "prompt_ids": [r["id"] for r in rows],
+                        "comparison_steps": comparison_steps,
+                        "cfg": "conditional_only",
+                        "student_cfg_scale": 1.0,
+                        "teacher_cfg_scale": contract.get("params", {}).get(
+                            "teacher_cfg_scale", 1.0
+                        ),
+                        "training_snapshots": "actual pre-optimizer forward tensors",
+                        "created_at": time.time(),
+                    },
+                )
+
         collective_call("reserve debug event (never overwrite)", reserve)
         if rank == 0:
-            logger.info("Debug %s: starting %d paired rollouts (6 / %d steps)",
-                        event.name, len(rows), comparison_steps)
+            logger.info(
+                "Debug %s: starting %d paired rollouts (6 / %d steps)",
+                event.name,
+                len(rows),
+                comparison_steps,
+            )
         model.eval()
         for phase in ("fake_score", "generator"):
+
             def save_local():
                 for snapshot in snapshots.get(phase, []):
                     row = snapshot["record"]
@@ -213,6 +319,7 @@ def debug_event(output, state, model, snapshots, evaluation, store, schedule, de
                     directory = event / ("train_fake" if phase == "fake_score" else "train_dmd")
                     directory = directory / f"rank_{rank:03d}" / f"ga_{ga:02d}" / row["id"]
                     save_train_sample(directory, snapshot, decoder, reference_root)
+
             collective_call(f"write {phase} debug tensors", save_local)
         local_count = 0
         for start in range(0, len(rows), world_size):
@@ -222,44 +329,85 @@ def debug_event(output, state, model, snapshots, evaluation, store, schedule, de
             sample_start = time.monotonic()
             # All ranks execute six FSDP forwards, even the non-writing padding ranks.
             result = rollout_sample(model, condition, row, schedule, device)
+
             def save_local_rollout():
                 if index < len(rows):
-                    save_rollout(event / "rollout" / row["id"], row, result, decoder,
-                                 {"updates": state.state_dict(), "rank": rank,
-                                  "seconds_before_decode": time.monotonic() - sample_start,
-                                  "peak_allocated_bytes": torch.cuda.max_memory_allocated(device),
-                                  "contract": contract})
+                    save_rollout(
+                        event / "rollout" / row["id"],
+                        row,
+                        result,
+                        decoder,
+                        {
+                            "updates": state.state_dict(),
+                            "rank": rank,
+                            "seconds_before_decode": time.monotonic() - sample_start,
+                            "peak_allocated_bytes": torch.cuda.max_memory_allocated(device),
+                            "contract": contract,
+                        },
+                    )
+
             collective_call("write rollout and trajectory", save_local_rollout)
             if comparison_steps:
-                comparison = rollout_sample(model, condition, row, schedule, device,
-                                            steps=comparison_steps, official_schedule=True,
-                                            capture_trajectory=False)
+                comparison = rollout_sample(
+                    model,
+                    condition,
+                    row,
+                    schedule,
+                    device,
+                    steps=comparison_steps,
+                    official_schedule=True,
+                    capture_trajectory=False,
+                )
+
                 def save_comparison():
                     if index < len(rows):
                         if not torch.equal(result[0], comparison[0]):
                             raise RuntimeError("Comparison initial noise differs")
-                        save_rollout(event / f"rollout_{comparison_steps}step" / row["id"],
-                                     row, comparison, decoder,
-                                     {"updates": state.state_dict(), "rank": rank,
-                                      "scheduler": schedule.config,
-                                      "schedule": "official_unmodified", "contract": contract})
+                        save_rollout(
+                            event / f"rollout_{comparison_steps}step" / row["id"],
+                            row,
+                            comparison,
+                            decoder,
+                            {
+                                "updates": state.state_dict(),
+                                "rank": rank,
+                                "scheduler": schedule.config,
+                                "schedule": "official_unmodified",
+                                "contract": contract,
+                            },
+                        )
+
                 collective_call("write official-schedule comparison", save_comparison)
             if rank == 0:
-                logger.info("Debug %s: rollout %d/%d written", event.name,
-                            min(start + world_size, len(rows)), len(rows))
+                logger.info(
+                    "Debug %s: rollout %d/%d written",
+                    event.name,
+                    min(start + world_size, len(rows)),
+                    len(rows),
+                )
             local_count += int(index < len(rows))
         counts = [None] * world_size
         dist.all_gather_object(counts, local_count)
         if sum(counts) != len(rows):
             raise RuntimeError("Debug event did not cover selected prompts")
+
         def commit():
             if rank == 0:
-                atomic_json(event / "summary.json", {"rollout_completed": sum(counts), "failed": 0,
-                    "comparison_completed": sum(counts) if comparison_steps else 0,
-                    "comparison_steps": comparison_steps,
-                    "training_samples_per_phase": {k: len(v) * world_size for k, v in snapshots.items()},
-                    "elapsed_seconds": time.monotonic() - started})
+                atomic_json(
+                    event / "summary.json",
+                    {
+                        "rollout_completed": sum(counts),
+                        "failed": 0,
+                        "comparison_completed": sum(counts) if comparison_steps else 0,
+                        "comparison_steps": comparison_steps,
+                        "training_samples_per_phase": {
+                            k: len(v) * world_size for k, v in snapshots.items()
+                        },
+                        "elapsed_seconds": time.monotonic() - started,
+                    },
+                )
                 atomic_json(event / "COMPLETE", {"updates": state.state_dict()})
+
         collective_call("commit debug event", commit)
     except Exception as exc:
         # Each worker records its own failure path; absence of COMPLETE is authoritative.

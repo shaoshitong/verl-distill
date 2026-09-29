@@ -27,6 +27,7 @@ def main():
     parser.add_argument("--attention-backend", choices=("sdpa", "flash2_segmented"), default="sdpa")
     parser.add_argument("--score-offload", action="store_true")
     parser.add_argument("--fake-phase-offload", action="store_true")
+    parser.add_argument("--tdm-rollout", action="store_true")
     args = parser.parse_args()
     require_qwen_runtime()
     context = initialize_distributed()
@@ -85,15 +86,23 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             inactive = generator if fake_phase else fake
             inactive_before = [p.detach().clone() for p in inactive.parameters()]
-            for _ in range(4):
+            for micro in range(4):
                 cursor.next_index()
                 clean = torch.randn(1, 4, 64, device=context.device)
                 s = torch.tensor([.4], device=context.device)
                 xt = renoise(clean, torch.randn_like(clean), s)
                 if fake_phase and gen_residency is not None:
                     gen_residency.load()
-                with torch.set_grad_enabled(not fake_phase):
-                    y = x0_from_velocity(xt, predict_velocity(generator, xt, s, condition), s)
+                if args.tdm_rollout:
+                    from verl_distill.algorithms.dmd.qwen_rollout import detached_prefix_rollout
+                    levels = torch.tensor([1., .94, .87, .77, .63, .4, 0.], device=context.device)
+                    y, _ = detached_prefix_rollout(
+                        clean, levels, [0, 1, 3, 5][micro],
+                        lambda x, t: predict_velocity(generator, x, t, condition),
+                        train_exit=not fake_phase)
+                else:
+                    with torch.set_grad_enabled(not fake_phase):
+                        y = x0_from_velocity(xt, predict_velocity(generator, xt, s, condition), s)
                 if fake_phase and gen_residency is not None:
                     gen_residency.offload()
                     assert real_residency.on_cpu
@@ -106,6 +115,10 @@ def main():
                     with torch.no_grad():
                         vf = predict_velocity(fake, noisy, s, condition)
                         vr = predict_velocity(real, noisy, s, condition)
+                        if args.tdm_rollout:
+                            from verl_distill.models.qwen_image21.guidance import combine_cfg
+                            negative = {**condition, "encoder_hidden_states": torch.zeros_like(condition["encoder_hidden_states"])}
+                            vr = combine_cfg(vr, predict_velocity(real, noisy, s, negative), 2.)
                     loss, _ = dmd_surrogate(y, noisy, vf, vr, s)
                 from verl_distill.engine.qwen_score_offload import offload_score_shards
                 with offload_score_shards((fake, real), enabled=args.score_offload and not fake_phase):

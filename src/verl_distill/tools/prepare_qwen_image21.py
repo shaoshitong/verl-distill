@@ -1,4 +1,5 @@
 """Create frozen production manifests and offline Qwen conditions; never launch training."""
+
 from __future__ import annotations
 
 import argparse
@@ -11,11 +12,21 @@ from pathlib import Path
 import torch
 
 from verl_distill.data.qwen_image21 import (
-    atomic_json, canonical_hash, read_manifest, sha256, validate_complete, within,
+    atomic_json,
+    canonical_hash,
+    read_manifest,
+    sha256,
+    validate_complete,
 )
 from verl_distill.models.qwen_image21.modeling import (
-    condition_key, encode_condition, load_condition_pipeline, model_identity,
-    require_qwen_runtime, save_condition, open_reused_cache, condition_entry_path,
+    condition_entry_path,
+    condition_key,
+    encode_condition,
+    load_condition_pipeline,
+    model_identity,
+    open_reused_cache,
+    require_qwen_runtime,
+    save_condition,
 )
 
 
@@ -33,21 +44,47 @@ def snapshot(args):
         if min(w, h) <= 0 or w % 32 or h % 32 or not p["prompt"]:
             raise ValueError(f"Invalid evaluation row: {p['prompt_id']}")
         seed = int(canonical_hash({"prompt_id": p["prompt_id"]})[:16], 16) % 2**63
-        evaluation.append({"id": p["prompt_id"], "kind": "t2i", "prompt": p["prompt"],
-                           "width": w, "height": h, "seed": seed,
-                           "reference_images": [], "reference_sha256": []})
+        evaluation.append(
+            {
+                "id": p["prompt_id"],
+                "kind": "t2i",
+                "prompt": p["prompt"],
+                "width": w,
+                "height": h,
+                "seed": seed,
+                "reference_images": [],
+                "reference_sha256": [],
+            }
+        )
     eval_texts = {p["prompt"] for p in prompts}
     records, rejected, excluded, seen = [], [], [], set()
     root = Path(args.output_root).resolve()
     # Only production output trees; no recursive search through smoke/debug directories.
-    paths = [path for kind in ("t2i", "edit")
-             for path in sorted((root / kind).glob("*/*/complete.json"))]
+    # Avoid one serialized remote stat per sample during pathlib's literal glob.
+    candidates = []
+    for kind in ("t2i", "edit"):
+        if not (root / kind).is_dir():
+            continue
+        for prefix in sorted((root / kind).iterdir()):
+            if prefix.is_dir():
+                candidates.extend(sample / "complete.json" for sample in prefix.iterdir())
+    candidates.sort()
+    with ThreadPoolExecutor(max_workers=32) as pool:
+        paths = [
+            path
+            for path, complete in zip(candidates, pool.map(Path.is_file, candidates))
+            if complete
+        ]
+    print(f"snapshot found {len(paths)} completed samples; checking payloads", flush=True)
+
     def validate_path(path):
         try:
-            return validate_complete(path, root, args.reference_root,
-                                     verify_hash=not args.fast_index), None
+            return validate_complete(
+                path, root, args.reference_root, verify_hash=not args.fast_index
+            ), None
         except (OSError, ValueError, KeyError, TypeError) as exc:
             return None, {"path": str(path), "error": str(exc)}
+
     # IO-bound hashing; preserve deterministic record order with executor.map.
     with ThreadPoolExecutor(max_workers=8) as pool:
         for index, (r, error) in enumerate(pool.map(validate_path, paths), 1):
@@ -63,23 +100,47 @@ def snapshot(args):
                 else:
                     records.append(r)
             if index % 250 == 0 or index == len(paths):
-                print(f"snapshot verified {index}/{len(paths)} rejected={len(rejected)}", flush=True)
+                print(
+                    f"snapshot verified {index}/{len(paths)} rejected={len(rejected)}", flush=True
+                )
     if not records:
         raise ValueError("No valid completed training samples")
     out.mkdir(parents=True)
-    common = {"schema": 1, "output_root": str(root), "reference_root": str(Path(args.reference_root).resolve()),
-              "prompts_csv_sha256": sha256(args.prompts_csv)}
-    for name, purpose, rows in (("train.json", "train", records), ("eval.json", "eval", evaluation)):
-        atomic_json(out / name, {**common, "purpose": purpose, "records": rows,
-                                "records_sha256": canonical_hash(rows),
-                                "payloads_verified": not args.fast_index})
+    common = {
+        "schema": 1,
+        "output_root": str(root),
+        "reference_root": str(Path(args.reference_root).resolve()),
+        "prompts_csv_sha256": sha256(args.prompts_csv),
+    }
+    for name, purpose, rows in (
+        ("train.json", "train", records),
+        ("eval.json", "eval", evaluation),
+    ):
+        atomic_json(
+            out / name,
+            {
+                **common,
+                "purpose": purpose,
+                "records": rows,
+                "records_sha256": canonical_hash(rows),
+                "payloads_verified": not args.fast_index,
+            },
+        )
     (out / "complex_prompt.csv").write_bytes(Path(args.prompts_csv).read_bytes())
-    atomic_json(out / "summary.json", {"train": len(records), "eval": len(evaluation),
-                "kind_counts": dict(Counter(r["kind"] for r in records)),
-                "reference_counts": dict(Counter(str(len(r["reference_images"])) for r in records)),
-                "sizes": dict(Counter(f"{r['width']}x{r['height']}" for r in records)),
-                "prompt_length_max": max(len(r["prompt"]) for r in records),
-                "eval_excluded": excluded, "rejected": rejected, "fast_index": args.fast_index})
+    atomic_json(
+        out / "summary.json",
+        {
+            "train": len(records),
+            "eval": len(evaluation),
+            "kind_counts": dict(Counter(r["kind"] for r in records)),
+            "reference_counts": dict(Counter(str(len(r["reference_images"])) for r in records)),
+            "sizes": dict(Counter(f"{r['width']}x{r['height']}" for r in records)),
+            "prompt_length_max": max(len(r["prompt"]) for r in records),
+            "eval_excluded": excluded,
+            "rejected": rejected,
+            "fast_index": args.fast_index,
+        },
+    )
     print(f"Snapshot ready: {out}; train={len(records)} rejected={len(rejected)}")
 
 
@@ -100,9 +161,14 @@ def cache(args):
     device = torch.device(args.device)
     if device.type == "cuda":
         torch.cuda.set_device(device)
-    descriptor = ({"root": str(Path(args.reuse_cache).resolve()),
-                   "index_sha256": sha256(Path(args.reuse_cache) / "index.json")}
-                  if args.reuse_cache else None)
+    descriptor = (
+        {
+            "root": str(Path(args.reuse_cache).resolve()),
+            "index_sha256": sha256(Path(args.reuse_cache) / "index.json"),
+        }
+        if args.reuse_cache
+        else None
+    )
     reused = open_reused_cache(descriptor, identity)
     pipe = None  # Reused conditions need no GPU encoding.
     entries = {}
@@ -115,13 +181,23 @@ def cache(args):
             continue
         if pipe is None:
             pipe = load_condition_pipeline(args.model, device)
-        condition = encode_condition(pipe, row, args.reference_root or train["reference_root"], device)
+        condition = encode_condition(
+            pipe, row, args.reference_root or train["reference_root"], device
+        )
         key, entry = save_condition(root, row, identity, condition)
         entries[key] = entry
-        print(f"cached {index+1}/{len(rows)} {row['kind']}/{row['id']}", flush=True)
-    atomic_json(root / f"shard-{args.shard_id:05d}.json", {
-        "schema": 1, "num_shards": args.num_shards, "model_identity": identity,
-        "manifest_hashes": hashes, "entries": entries, "reused_cache": descriptor})
+        print(f"cached {index + 1}/{len(rows)} {row['kind']}/{row['id']}", flush=True)
+    atomic_json(
+        root / f"shard-{args.shard_id:05d}.json",
+        {
+            "schema": 1,
+            "num_shards": args.num_shards,
+            "model_identity": identity,
+            "manifest_hashes": hashes,
+            "entries": entries,
+            "reused_cache": descriptor,
+        },
+    )
 
 
 def publish(args):
@@ -150,6 +226,7 @@ def publish(args):
     if set(entries) != expected:
         raise ValueError("Condition cache coverage mismatch")
     reused = open_reused_cache(descriptor, identity)
+
     def verify_entry(item):
         key, entry = item
         path = condition_entry_path(root, key, entry, reused)
@@ -160,12 +237,21 @@ def publish(args):
             return
         if sha256(path) != entry["sha256"]:
             raise ValueError("Corrupt condition cache payload")
+
     with ThreadPoolExecutor(max_workers=8) as pool:
         for index, _ in enumerate(pool.map(verify_entry, entries.items()), 1):
             if index % 500 == 0 or index == len(entries):
                 print(f"cache verified {index}/{len(entries)}", flush=True)
-    atomic_json(root / "index.json", {"schema": 1, "model_identity": identity,
-                "manifest_hashes": hashes, "entries": entries, "reused_cache": descriptor})
+    atomic_json(
+        root / "index.json",
+        {
+            "schema": 1,
+            "model_identity": identity,
+            "manifest_hashes": hashes,
+            "entries": entries,
+            "reused_cache": descriptor,
+        },
+    )
     print(f"Published {len(entries)} conditions")
 
 
@@ -177,7 +263,9 @@ def main():
     s.add_argument("--reference-root", required=True)
     s.add_argument("--prompts-csv", required=True)
     s.add_argument("--snapshot-dir", required=True)
-    s.add_argument("--fast-index", action="store_true", help="Skip payload hashing at indexing only")
+    s.add_argument(
+        "--fast-index", action="store_true", help="Skip payload hashing at indexing only"
+    )
     for command in ("cache", "publish"):
         c = commands.add_parser(command)
         c.add_argument("--manifest", required=True)

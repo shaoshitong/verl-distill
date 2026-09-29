@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "verl-distill"
 version = "0.1.0"
-description = "A structured training framework for Z-Image distillation"
+description = "Z-Image and Qwen-Image-2.1 distillation training"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}
@@ -27,13 +27,15 @@ train = [
   "pylance>=0.20",
 ]
 qwen21 = [
-  "diffusers @ git+https://github.com/huggingface/diffusers@80c7ed262aeffbeb43ef13ae04baeb9b84515a69",
+  "diffusers>=0.37.0,<0.38",
   "transformers==5.17.0",
   "accelerate==1.13.0",
   "huggingface-hub==1.32.0",
   "tokenizers==0.23.2",
   "safetensors==0.8.0",
   "peft==0.18.1",
+  "matplotlib>=3.10,<3.11",
+  "einops>=0.8,<0.9",
 ]
 dev = ["pytest>=8", "ruff>=0.9"]
 

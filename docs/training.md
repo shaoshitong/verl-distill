@@ -1,8 +1,10 @@
-# Training
+# Z-Image training
+
+Qwen recipes use a separate environment and data format; see [Qwen training](qwen_image21.md).
 
 ## Inputs
 
-All methods require:
+The JSONL recipes use:
 
 | Variable | Required | Meaning |
 | --- | --- | --- |
@@ -79,3 +81,80 @@ Distributed samplers receive a new epoch value whenever a dataloader is
 restarted. Resume restores model, optimizer, scheduler, EMA, and process RNG
 state. It does not serialize worker prefetch queues; exact next-sample replay is
 not guaranteed when resuming a multi-worker dataloader mid-epoch.
+
+## Full-model DMD with ODE warmup
+
+Example launch on 8 GPUs:
+
+```bash
+cd /path/to/verl-distill
+
+export PYTHONPATH=src
+export TOKENIZERS_PARALLELISM=false
+export TORCH_NCCL_AVOID_RECORD_STREAMS=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+export ZIMAGE_MODEL_PATH=/path/to/Z-Image-FM1
+export ZIMAGE_TEACHER_MODEL_PATH=/path/to/Z-Image
+export ZIMAGE_FAKE_SCORE_MODEL_PATH=/path/to/Z-Image-FM1
+export TRAIN_LANCE_DATA_DIR=/path/to/zimage_merged_notext_turbogen_lance
+export ZIMAGE_ODE_PAIR_DIR=/path/to/ode_pairs/zimage_turbo_cfg0_buckets_seq1024_lance4_text6_full_qwen_scored
+export OUTPUT_DIR=/path/to/verl-distill-runs/dmd_refaligned_fsdp1_ode_warmup_50000
+
+torchrun --standalone --nproc-per-node=8 \
+  -m verl_distill.cli.train \
+  --config configs/recipes/zimage/dmd_refaligned_ode_warmup_fsdp1.yaml
+```
+
+The Lance dataset path is provided through `TRAIN_LANCE_DATA_DIR`:
+
+```text
+/path/to/zimage_merged_notext_turbogen_lance
+```
+
+`TRAIN_MANIFEST` is not used by the Lance recipe.
+
+### Outputs
+
+Training writes to `OUTPUT_DIR`:
+
+- `train.log`: scalar logs
+- `debug_samples/step-xxxx/trajectory.png`: 4-step debug trajectory grid
+- `debug_dmd_tensors/step-xxxx/`: optional tensor/image dumps when enabled
+- `checkpoints/step-xxxx/`: distributed checkpoints
+
+Generated outputs are intentionally ignored by git. Keep large runs outside the
+source checkout, for example under a sibling `verl-distill-runs` directory.
+
+### Dataset publication
+
+The training data for this recipe is published separately as a Hugging Face
+dataset:
+
+```text
+sst12345/verl-distill-dataset
+```
+
+Expected layout:
+
+```text
+zimage_merged_notext_turbogen_lance/
+ode_pairs/zimage_turbo_cfg0_buckets_seq1024_lance4_text6_full_qwen_scored/
+ode_pair_archives/zimage_turbo_cfg0_buckets_seq1024_lance4_text6_full_qwen_scored/
+```
+
+The Lance directory is uploaded directly. The ODE warmup pairs are also exposed
+as archive shards under `ode_pair_archives/` to avoid pushing tens of thousands
+of small files through the Hub. Reconstruct the local ODE pair directory with:
+
+```bash
+ARCHIVE_DIR=/path/to/ode_pair_archives/zimage_turbo_cfg0_buckets_seq1024_lance4_text6_full_qwen_scored
+ODE_DIR=/path/to/ode_pairs/zimage_turbo_cfg0_buckets_seq1024_lance4_text6_full_qwen_scored
+
+mkdir -p "$ODE_DIR"
+cd "$ODE_DIR"
+
+cat "$ARCHIVE_DIR"/images.tar.part-* | tar -xf -
+cat "$ARCHIVE_DIR"/latents.tar.part-* | tar -xf -
+cat "$ARCHIVE_DIR"/noise.tar.part-* | tar -xf -
+```

@@ -1,4 +1,6 @@
-# Checkpoints
+# Z-Image checkpoints
+
+Qwen uses its own checkpoint layout and resume checks; see [Qwen training](qwen_image21.md#输出与恢复).
 
 ## Training state
 

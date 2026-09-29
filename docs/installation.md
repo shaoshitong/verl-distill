@@ -1,4 +1,6 @@
-# Installation
+# Z-Image installation
+
+For Qwen-Image-2.1 use the separate [Qwen environment](qwen_image21.md#环境).
 
 ## Requirements
 

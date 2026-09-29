@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Explicit invocation only: this script does not stop GPU jobs, allocate nodes or SSH.
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 export PYTHONPATH="${repo_root}/src${PYTHONPATH:+:${PYTHONPATH}}"
 export TOKENIZERS_PARALLELISM=false
@@ -24,4 +23,4 @@ else
 fi
 exec "$qwen_python" -m torch.distributed.run "${launch_args[@]}" \
     -m verl_distill.cli.train --config \
-    "$repo_root/configs/recipes/qwen_image21/reflow_dmd_fsdp1.yaml" "$@"
+    "$repo_root/configs/recipes/qwen_image21/dmd_hf_cfg2_fsdp1.yaml" "$@"
