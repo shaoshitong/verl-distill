@@ -45,10 +45,9 @@ def within(root, relative):
 def validate_complete(path, output_root, reference_root, *, verify_hash=True):
     path = Path(path)
     meta = json.loads(path.read_text())
-    required = {"num_inference_steps": 40, "true_cfg_scale": 1.0, "vae_tiling": False,
+    required = {"model_revision": MODEL_REVISION, "num_inference_steps": 40,
+                "true_cfg_scale": 1.0, "vae_tiling": False,
                 "model_cpu_offload": True, "use_kv_cache": True}
-    if MODEL_REVISION:
-        required["model_revision"] = MODEL_REVISION
     for key, expected in required.items():
         if meta.get(key) != expected:
             raise ValueError(f"{path}: {key} != {expected}")
@@ -225,4 +224,208 @@ class RankCursor:
         self.epoch, self.position = int(state["epoch"]), int(state["position"])
         if not 0 <= self.bucket_start <= self.position <= (self.size + self.world_size - 1)//self.world_size:
             raise ValueError("Invalid restored data cursor")
+        self._indices = self._permutation()
+
+
+def cached_token_metadata(records, cache_root):
+    """Read cache shapes and small image mask, never read large tensor storage or use CUDA.
+
+    Returns manifest-aligned records plus index provenance. Intended as an offline
+    preparation step; callers should persist this small result rather than scan at
+    every training startup. Tensor content checks remain ConditionStore's job.
+    """
+    from verl_distill.models.qwen_image21.modeling import (
+        condition_key, condition_entry_path, open_reused_cache,
+    )
+    root = Path(cache_root)
+    index_path = root / 'index.json'
+    index = json.loads(index_path.read_text())
+    reused = open_reused_cache(index.get('reused_cache'), index['model_identity'])
+    result = []
+    for row in records:
+        key = condition_key(row, index['model_identity'])
+        entry = index['entries'][key]
+        path = condition_entry_path(root, key, entry, reused)
+        saved = torch.load(path, map_location='cpu', weights_only=True, mmap=True)
+        if saved['key'] != key:
+            raise ValueError('Cached condition key mismatch')
+        condition = saved['condition']
+        shapes = condition['img_shapes'][0]
+        target = (row['height'] // 16) * (row['width'] // 16)
+        counts = [int(t) * int(h) * int(w) for t, h, w in shapes]
+        if len(counts) != len(row['reference_images']) + 1 or counts[-1] != target:
+            raise ValueError('Cached image shapes do not match manifest')
+        vlm_length = int(condition['encoder_hidden_states'].shape[1])
+        # mmap maps large storages lazily; only the tiny boolean mask is read.
+        text = int((~condition['img_mask'][0, :vlm_length]).sum().item())
+        refs = sum(counts[:-1])
+        result.append({'id': row['id'], 'kind': row['kind'],
+                       'width': row['width'], 'height': row['height'],
+                       'reference_count': len(row['reference_images']),
+                       'target_tokens': target, 'reference_tokens': refs,
+                       'text_tokens': text, 'total_tokens': target + refs + text})
+    return {'schema': 1, 'records_sha256': canonical_hash(records),
+            'cache_index_sha256': sha256(index_path), 'metadata': result,
+            'metadata_sha256': canonical_hash(result)}
+
+
+class HomogeneousRankCursor:
+    """Opt-in v2: global length groups with hard kind/reference-count separation.
+
+    No random pool tails. Ratio bounds are enforced while forming groups. A
+    partial group is padded using its own members only; every real slot survives.
+    Padding is explicit in epoch_stats and repeated indices count toward work.
+    Old checkpoints require migrate_from_legacy(), never implicit migration.
+    """
+    ordering = 'homogeneous_v2'
+
+    def __init__(self, metadata, rank, world_size, seed, *, max_token_ratio=1.25,
+                 max_resolution_ratio=1.5):
+        if not metadata or not 0 <= rank < world_size or world_size < 1:
+            raise ValueError('Invalid dataset/rank/world size')
+        if max_token_ratio < 1 or max_resolution_ratio < 1:
+            raise ValueError('Similarity ratios must be >= 1')
+        self.metadata = metadata
+        self.size, self.rank, self.world_size, self.seed = len(metadata), rank, world_size, seed
+        self.max_token_ratio, self.max_resolution_ratio = max_token_ratio, max_resolution_ratio
+        self.metadata_hash = canonical_hash(metadata)
+        for m in metadata:
+            if m['kind'] not in ('t2i', 'edit') or (m['kind'] == 't2i') != (m['reference_count'] == 0):
+                raise ValueError('kind/reference count mismatch')
+            if any(m[k] <= 0 for k in ('target_tokens', 'text_tokens', 'total_tokens', 'width', 'height')):
+                raise ValueError('Nonpositive token/dimension metadata')
+            if m['reference_tokens'] < 0 or m['total_tokens'] != m['target_tokens'] + m['reference_tokens'] + m['text_tokens']:
+                raise ValueError('Invalid token metadata')
+        self.epoch = self.position = 0
+        self._indices = None
+        self._migration_pending = None
+        self.migration_audit = None
+        self.epoch_stats = {}
+
+    def _global_order(self):
+        pending = list(range(self.size)) if self._migration_pending is None else list(self._migration_pending)
+        rng = torch.Generator().manual_seed(self.seed + self.epoch)
+        # Shuffle before stable cost sorting so equal-cost records vary by epoch.
+        pending = [pending[j] for j in torch.randperm(len(pending), generator=rng).tolist()]
+        partitions = {}
+        for i in pending:
+            m = self.metadata[i]
+            partitions.setdefault((m['kind'], m['reference_count']), []).append(i)
+        groups, padding = [], 0
+        dims = ('target_tokens', 'reference_tokens', 'total_tokens', 'width', 'height')
+        def close(group):
+            nonlocal padding
+            if group:
+                count = (-len(group)) % self.world_size
+                padding += count
+                padded = group + [group[j % len(group)] for j in range(count)]
+                groups.append(padded)
+        import math
+        def band(value, ratio):
+            return value if ratio == 1 else math.floor(math.log(max(1, value), ratio))
+        def sort_key(i):
+            m = self.metadata[i]
+            # Coarse resolution bands first avoid interleaving portrait/landscape
+            # at every nearly-equal target-token value (and excessive padding).
+            return (band(m['target_tokens'], self.max_token_ratio),
+                    band(m['width'], self.max_resolution_ratio),
+                    band(m['height'], self.max_resolution_ratio),
+                    band(m['reference_tokens'], self.max_token_ratio), m['total_tokens'])
+        for partition in sorted(partitions):
+            ordered = sorted(partitions[partition], key=sort_key)
+            group, lows, highs = [], {}, {}
+            for i in ordered:
+                m = self.metadata[i]
+                proposed_low = {k: min(lows.get(k, m[k]), m[k]) for k in dims}
+                proposed_high = {k: max(highs.get(k, m[k]), m[k]) for k in dims}
+                fits = all(proposed_high[k] <= proposed_low[k] * (
+                    self.max_resolution_ratio if k in ('width', 'height') else self.max_token_ratio)
+                    for k in dims)
+                if group and not fits:
+                    close(group)
+                    group, lows, highs = [], {}, {}
+                group.append(i)
+                lows = {k: min(lows.get(k, m[k]), m[k]) for k in dims}
+                highs = {k: max(highs.get(k, m[k]), m[k]) for k in dims}
+                if len(group) == self.world_size:
+                    close(group)
+                    group, lows, highs = [], {}, {}
+            close(group)
+        order = []
+        for j in torch.randperm(len(groups), generator=rng).tolist():
+            group = groups[j]
+            order.extend(group[k] for k in torch.randperm(len(group), generator=rng).tolist())
+        self.epoch_stats = {'input_slots': len(pending), 'padded_slots': padding,
+                            'output_slots': len(order), 'global_batches': len(groups),
+                            'padding_fraction': padding / len(order) if order else 0.0,
+                            'unique_input_samples': len(set(pending)),
+                            'mixed_kind_batches': 0}
+        return order
+
+    def _permutation(self):
+        return self._global_order()[self.rank::self.world_size]
+
+    def next_index(self):
+        if self._indices is None:
+            self._indices = self._permutation()
+        if self.position == len(self._indices):
+            self.epoch += 1
+            self.position = 0
+            self._migration_pending = None
+            self._indices = self._permutation()
+        value = self._indices[self.position]
+        self.position += 1
+        return value
+
+    def state_dict(self):
+        return {'ordering': self.ordering,
+                **{k: getattr(self, k) for k in ('size', 'rank', 'world_size', 'seed', 'epoch', 'position',
+                    'metadata_hash', 'max_token_ratio', 'max_resolution_ratio')},
+                'migration_pending': self._migration_pending, 'migration_audit': self.migration_audit}
+
+    def load_state_dict(self, state):
+        if state.get('ordering') != self.ordering:
+            raise ValueError('Legacy migration requires explicit migrate_from_legacy()')
+        for k in ('size', 'rank', 'world_size', 'seed', 'metadata_hash', 'max_token_ratio', 'max_resolution_ratio'):
+            if state[k] != getattr(self, k):
+                raise ValueError(f'Homogeneous cursor {k} changed')
+        self.epoch, self.position = int(state['epoch']), int(state['position'])
+        self._migration_pending = state.get('migration_pending')
+        if self._migration_pending is not None and any(type(i) is not int or not 0 <= i < self.size for i in self._migration_pending):
+            raise ValueError('Invalid migration suffix indices')
+        self.migration_audit = state.get('migration_audit')
+        self._indices = self._permutation()
+        if self.epoch < 0 or not 0 <= self.position <= len(self._indices):
+            raise ValueError('Invalid homogeneous cursor position')
+
+    def migrate_from_legacy(self, state, *, legacy_costs=None, allow=False):
+        """Explicit same-world migration; reconstruct old unconsumed global suffix.
+
+        Caller must verify all saved rank cursors have equal epoch/position and
+        identical ordering contracts before calling this on each rank. Different
+        world sizes or manifests require a separately reviewed migration.
+        """
+        if not allow:
+            raise ValueError('Migration requires allow=True and audited saved cursors')
+        for k in ('size', 'rank', 'world_size', 'seed'):
+            if state[k] != getattr(self, k):
+                raise ValueError(f'Legacy migration {k} changed')
+        if state.get('ordering', 'random') not in ('random', 'bucketed_v1'):
+            raise ValueError('Unsupported legacy ordering')
+        if (state.get('ordering', 'random') == 'bucketed_v1') != (legacy_costs is not None):
+            raise ValueError('Supply exact legacy costs only for bucketed_v1')
+        suffixes = []
+        for rank in range(self.world_size):
+            old = RankCursor(self.size, rank, self.world_size, self.seed, costs=legacy_costs,
+                             bucket_batches=state.get('bucket_batches', 64))
+            old.load_state_dict({**state, 'rank': rank})
+            suffixes.append(old._indices[old.position:])
+        pending = [i for group in zip(*suffixes, strict=True) for i in group]
+        self.epoch, self.position = state['epoch'], 0
+        if len(pending) != ((self.size + self.world_size - 1)//self.world_size - state['position']) * self.world_size:
+            raise ValueError('Legacy migration lost source suffix slots')
+        self._migration_pending = pending
+        self.migration_audit = {'source_state': state, 'pending_slots': len(pending),
+                                'pending_sha256': canonical_hash(pending),
+                                'consumed_slots': state['position'] * self.world_size}
         self._indices = self._permutation()

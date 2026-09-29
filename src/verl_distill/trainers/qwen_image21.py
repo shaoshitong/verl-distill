@@ -30,6 +30,7 @@ from verl_distill.algorithms.dmd.qwen_image21 import (
     x0_from_velocity,
 )
 from verl_distill.algorithms.dmd.qwen_rollout import detached_prefix_rollout
+from verl_distill.models.qwen_image21.features import install_feature_forward, predict_features, feature_cosine_loss
 from verl_distill.data.qwen_image21 import (
     QwenPairDataset,
     RankCursor,
@@ -52,7 +53,7 @@ from verl_distill.engine.qwen_checkpoint import (
 )
 from verl_distill.engine.qwen_score_offload import PhaseShardOffload, offload_score_shards
 from verl_distill.models.qwen_image21.configuration import validate_qwen_config
-from verl_distill.models.qwen_image21.guidance import combine_cfg
+from verl_distill.models.qwen_image21.guidance import combine_cfg, predict_fake_cfg
 from verl_distill.models.qwen_image21.modeling import (
     ConditionStore,
     QwenDecoder,
@@ -236,8 +237,20 @@ def train(config):
 
 
 def _train(config, context):
+    from verl_distill.engine.async_jsonl import AsyncJSONL
+    writer = AsyncJSONL()
+    try:
+        return _train_with_writer(config, context, writer)
+    finally:
+        # Local only: asymmetric I/O failure must never enter a new collective.
+        writer.close()
+
+
+def _train_with_writer(config, context, writer):
     rank, device, world = context.rank, context.device, context.world_size
     runtime, params, data = config["runtime"], config["method"]["params"], config["data"]
+    from verl_distill.engine.scaling_bench import settings, update_seed, completion_name
+    bench = settings(config)
     seed = int(runtime.get("seed", 42))
     random.seed(seed + rank)
     np.random.seed((seed + rank) % 2**32)
@@ -297,6 +310,7 @@ def _train(config, context):
     )
     negative_store = None
     teacher_cfg = float(params.get("teacher_cfg_scale", 1.0))
+    fake_cfg = float(params.get("fake_cfg_scale", 1.0))
     if teacher_cfg > 1:
         negative_store = collective_call(
             "open negative condition cache",
@@ -325,6 +339,7 @@ def _train(config, context):
             "allow_infra_resume_change",
             "resume_refinement",
             "resume_dmd_fork",
+            "resume_recipe_migration",
             "allow_condition_cache_rebuild",
         )
     }
@@ -345,7 +360,8 @@ def _train(config, context):
         ),
         "fsdp_use_orig_params": True,
     }
-    if negative_store is not None:
+    contract["fake_guidance"] = "conditional_only_single_forward_v1"
+    if teacher_cfg > 1:
         contract["teacher_guidance"] = {
             "scale": teacher_cfg,
             "negative_prompt": "",
@@ -364,6 +380,7 @@ def _train(config, context):
             lambda: inspect_checkpoint(
                 resume,
                 contract,
+                migration=runtime.get("resume_recipe_migration"),
                 allow_infra_change=bool(runtime.get("allow_infra_resume_change", False)),
                 refinement=runtime.get("resume_refinement"),
                 dmd_fork=bool(runtime.get("resume_dmd_fork", False)),
@@ -391,19 +408,49 @@ def _train(config, context):
         if runtime.get("data_ordering", "random") == "bucketed_v1"
         else None
     )
-    cursor = RankCursor(
-        len(dataset),
-        rank,
-        world,
-        seed,
-        costs=costs,
-        bucket_batches=int(runtime.get("bucket_batches", 64)),
-        allow_ordering_migration=bool(runtime.get("allow_infra_resume_change", False)),
-    )
+    homogeneous = runtime.get("data_ordering") == "homogeneous_v2"
+    if homogeneous:
+        from verl_distill.data.qwen_image21 import HomogeneousRankCursor
+        from verl_distill.engine.homogeneous_metadata import load_metadata, validate_resume
+        metadata, metadata_audit = collective_call("validate homogeneous token metadata",
+            lambda: load_metadata(runtime["token_metadata_path"], dataset.records, data["condition_cache"]))
+        metadata_identities = [None] * world
+        dist.all_gather_object(metadata_identities, metadata_audit)
+        if any(identity != metadata_audit for identity in metadata_identities):
+            raise ValueError("Ranks resolved different homogeneous token metadata")
+        cursor = HomogeneousRankCursor(metadata, rank, world, seed,
+            max_token_ratio=float(runtime.get("max_token_ratio", 1.25)),
+            max_resolution_ratio=float(runtime.get("max_resolution_ratio", 1.5)))
+        if resume:
+            if runtime.get("resume_recipe_migration"):
+                from verl_distill.engine.homogeneous_metadata import migrate_legacy_checkpoint
+                migration_audit = collective_call("audit and migrate 32 saved cursors", lambda:
+                    migrate_legacy_checkpoint(resume, cursor,
+                        [estimated_training_tokens(r) for r in dataset.records]))
+                audits = [None] * world
+                dist.all_gather_object(audits, migration_audit["all_rank_cursors_sha256"])
+                if len(set(audits)) != 1:
+                    raise ValueError("Ranks read different migration cursor states")
+                (output / f"resume-migration-rank{rank:05d}.json").write_text(
+                    json.dumps(migration_audit, indent=2))
+            else:
+                validate_resume(saved)
+    else:
+        cursor = RankCursor(
+            len(dataset),
+            rank,
+            world,
+            seed,
+            costs=costs,
+            bucket_batches=int(runtime.get("bucket_batches", 64)),
+            allow_ordering_migration=bool(runtime.get("allow_infra_resume_change", False)),
+        )
     reset_data_cursor = bool(
         resume
         and saved["contract"]["manifest_hashes"]["train"] != contract["manifest_hashes"]["train"]
     )
+    if homogeneous and reset_data_cursor:
+        validate_resume(saved, reset_data_cursor=True)
     if reset_data_cursor:
 
         def verify_dataset_extension():
@@ -467,6 +514,15 @@ def _train(config, context):
         "write infrastructure audit",
         lambda: atomic_json(output / f"infra-rank-{rank:05d}.json", generator._infra_audit),
     )
+    feature_reflow = params.get("reflow_loss", "velocity_mse") == "tdm_feature_cosine"
+    feature_teacher = None
+    if feature_reflow and state.reflow_updates < int(params["reflow_updates"]):
+        teacher_model = load_transformer(config["model"]["pretrained_model"], runtime.get("attention_backend", "sdpa"))
+        install_feature_forward(teacher_model)
+        teacher_model.enable_gradient_checkpointing(gradient_checkpointing_func=partial(checkpoint, use_reentrant=False))
+        feature_teacher = wrap_model(teacher_model, context.local_rank, False)
+        feature_teacher.eval()
+        del teacher_model
     fake = real = fake_optimizer = None
     gen_spec = config["optimizer"]["generator" if state.dmd_initialized else "reflow"]
     gen_optimizer = optimizer_for(generator, gen_spec)
@@ -520,6 +576,7 @@ def _train(config, context):
             cursor,
             rank=rank,
             reset_data_cursor=reset_data_cursor,
+            migrated_cursor=bool(runtime.get("resume_recipe_migration")),
             model_only=bool(runtime.get("resume_dmd_fork", False)) and not state.dmd_initialized,
         )
         # DCP restores optimizer param_groups, including the OLD LR. Apply the
@@ -544,12 +601,23 @@ def _train(config, context):
     decoder = None  # VAE initialized only for the first scheduled debug event.
     reflow_total, fake_total = int(params["reflow_updates"]), int(params["fake_updates"])
     debug_snapshots = {}
+    if homogeneous:
+        if cursor._indices is None:
+            cursor._indices = cursor._permutation()
+        collective_call("record homogeneous sampler audit", lambda: atomic_json(
+            output / f"sampler-rank-{rank:05d}.json",
+            {"ordering": "homogeneous_v2", **metadata_audit,
+             "epoch": cursor.epoch, "position": cursor.position,
+             "epoch_stats": cursor.epoch_stats,
+             "max_token_ratio": cursor.max_token_ratio,
+             "max_resolution_ratio": cursor.max_resolution_ratio}))
     last_checkpoint = None
     log_path = output / "logs" / f"rank-{rank:05d}.jsonl"
     collective_call("create logs", lambda: log_path.parent.mkdir(parents=True, exist_ok=True))
 
     def save(name):
         nonlocal last_checkpoint
+        collective_call("flush scalar logs before checkpoint", writer.flush)
         if rank == 0:
             logger.info("Saving checkpoint %s before any scheduled debug", name)
         cp_models, cp_optimizers = {"generator": generator}, {"generator": gen_optimizer}
@@ -583,6 +651,7 @@ def _train(config, context):
 
     generator_residency = real_residency = None
     while True:
+        writer.check()
         phase = state.next_phase(reflow_total, fake_total)
         if phase == "complete":
             break
@@ -592,6 +661,12 @@ def _train(config, context):
             # the previous loop's `optimizer` may still reference the old optimizer.
             gen_optimizer.state.clear()
             gen_optimizer = optimizer_for(generator, config["optimizer"]["generator"])
+            if feature_teacher is not None:
+                del feature_teacher
+                feature_teacher = None
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
             fake, real = load_scores()
             fake_initialization = params.get("fake_initialization", "reflow_generator")
             if fake_initialization == "reflow_generator":
@@ -611,6 +686,8 @@ def _train(config, context):
                             or ("hf" if reflow_total == 0 else "in-process REFLOW")
                         ),
                         "fake_initialization": fake_initialization,
+                        "fake_cfg_scale": fake_cfg,
+                        "real_cfg_scale": teacher_cfg,
                         "real_initialization": "hf",
                         "hf_model": config["model"]["pretrained_model"],
                         "generator_lr": config["optimizer"]["generator"]["lr"],
@@ -643,18 +720,26 @@ def _train(config, context):
         optimizer.zero_grad(set_to_none=True)
         optimizer_step = state.fake_updates + 1 if is_fake else state.fake_updates
         capture = (
-            phase != "reflow" and optimizer_step % int(runtime["debug_every_fake_updates"]) == 0
+            bench is None and phase != "reflow" and optimizer_step % int(runtime["debug_every_fake_updates"]) == 0
         )
         captures, micro_logs = [], []
         hit_counts = [0] * 6
         started = time.monotonic()
         torch.cuda.reset_peak_memory_stats(device)
+        from verl_distill.engine.bounded_profile import BoundedProfile
+        step_profiler = BoundedProfile(output, rank, phase, before, {"generator": generator, "fake": fake, "real": real})
+        if bench is not None:
+            bench_seed = update_seed(bench, phase, before)
+            random.seed(bench_seed)
+            np.random.seed(bench_seed)
+            torch.manual_seed(bench_seed)
+            torch.cuda.manual_seed_all(bench_seed)
         # A bounded first-shard probe exposes accidental no-op/phase leakage in logs.
         probe_param = next(p for p in active.parameters() if p.requires_grad and p.numel())
         probe_before = probe_param.detach().flatten()[:1024].clone()
         for ga_index in range(ga):
             fetched = time.monotonic()
-            item = collective_call("load next data pair", lambda: dataset[cursor.next_index()])
+            item = collective_call("load next data pair", lambda: dataset[bench["sample_index"] if bench is not None else cursor.next_index()])
             row = item["record"]
             condition = collective_call("load sample condition", lambda: store.get(row, device))
             target_tokens = item["clean"].shape[1]
@@ -682,8 +767,10 @@ def _train(config, context):
             )
             clean = item["clean"].to(device)
             levels = schedule.levels(row["height"], row["width"], device=device)
-            rollout_input = phase != "reflow" and params["generator_input"] == "rollout_dataset_noise"
+            rollout_input = (phase == "reflow" and feature_reflow) or (phase != "reflow" and params["generator_input"] == "rollout_dataset_noise")
             exit_draw = torch.randint(6, (1,), device=device)
+            if bench is not None:
+                exit_draw.fill_(bench["exit_index"])
             if rollout_input:
                 # FSDP all-gathers must have the same forward-call count on all ranks.
                 dist.broadcast(exit_draw, src=0)
@@ -700,7 +787,21 @@ def _train(config, context):
                 "generator_sigma": sigma,
             }
             fake_offload_stats = {}
-            if phase == "reflow":
+            if phase == "reflow" and feature_reflow:
+                generated, gen_input = detached_prefix_rollout(
+                    noise, levels, step_index,
+                    lambda x, t: predict_velocity(generator, x, t, condition), train_exit=True,
+                )
+                score_sigma = schedule.score_sigma(row["height"], row["width"],
+                    float(params["score_sigma_min"]), float(params["score_sigma_max"]), device)
+                with torch.no_grad():
+                    target_features = predict_features(feature_teacher, renoise(clean, noise, score_sigma), score_sigma, condition)
+                predicted_features = predict_features(feature_teacher, renoise(generated, noise, score_sigma), score_sigma, condition)
+                loss = feature_cosine_loss(predicted_features, target_features)
+                tensors.update(generator_input=gen_input, generator_x0=generated, score_sigma=score_sigma)
+                aux = {}
+                del predicted_features, target_features
+            elif phase == "reflow":
                 velocity = predict_velocity(generator, gen_input, sigma, condition)
                 loss = reflow_loss(velocity, clean, noise)
                 tensors.update(
@@ -737,7 +838,7 @@ def _train(config, context):
                 score_noise = torch.randn_like(generated)
                 noisy = renoise(generated.detach(), score_noise, score_sigma)
                 if is_fake:
-                    fake_velocity = predict_velocity(fake, noisy, score_sigma, condition)
+                    fake_velocity = predict_fake_cfg(fake, noisy, score_sigma, condition, scale=fake_cfg)
                     loss, aux = fake_score_loss(
                         noisy,
                         fake_velocity,
@@ -752,9 +853,9 @@ def _train(config, context):
                     tensors["fake_velocity"] = fake_velocity
                 else:
                     with torch.no_grad():
-                        fake_velocity = predict_velocity(fake, noisy, score_sigma, condition)
+                        fake_velocity = predict_fake_cfg(fake, noisy, score_sigma, condition, scale=fake_cfg)
                         conditional_real = predict_velocity(real, noisy, score_sigma, condition)
-                        if negative_store is not None:
+                        if teacher_cfg > 1:
                             negative_condition = collective_call(
                                 "load Teacher negative condition",
                                 lambda: negative_store.get(row, condition, device),
@@ -802,6 +903,9 @@ def _train(config, context):
                 (loss / ga).backward()
                 torch.cuda.synchronize(device)
             backward_seconds = time.monotonic() - backward_start
+            if phase == "reflow" and feature_reflow:
+                if any(p.requires_grad or p.grad is not None for p in feature_teacher.parameters()):
+                    raise RuntimeError("Frozen feature teacher unexpectedly acquired parameter gradients")
             meta = {
                 "phase": phase,
                 "updates_before": before,
@@ -827,15 +931,27 @@ def _train(config, context):
                 "forward_seconds": forward_seconds,
                 "backward_seconds": backward_seconds,
             }
+            if phase in ("fake_score", "generator"):
+                meta["fake_score_forward_branches"] = 1
+                meta["real_score_forward_branches"] = (2 if teacher_cfg > 1 else 1) if phase == "generator" else 0
+                meta["fake_guidance"] = "conditional_only"
             if phase == "generator":
+                meta["fake_cfg_scale"] = fake_cfg
                 meta["teacher_cfg_scale"] = teacher_cfg
-                meta["teacher_negative_prompt"] = "" if negative_store is not None else None
-                meta["teacher_reference_images_preserved"] = negative_store is not None
+                meta["teacher_negative_prompt"] = "" if teacher_cfg > 1 else None
+                meta["teacher_reference_images_preserved"] = teacher_cfg > 1
             meta.update(
                 actual_total_tokens=target_tokens + reference_tokens + text_tokens,
                 reference_tokens=reference_tokens,
                 text_tokens=text_tokens,
             )
+            if phase == "reflow" and feature_reflow:
+                meta.update(reflow_loss="tdm_feature_cosine", initial_noise_source="dataset",
+                    generator_nfe=step_index + 1, prefix_detached=True,
+                    rollout_path=levels[:step_index + 1].tolist() + [0.0],
+                    score_sigma=score_sigma.item(), score_flow_shift=params["score_flow_shift"],
+                    feature_noise_source="dataset", feature_layer="last_transformer_block_pre_norm_proj_unpatch",
+                    feature_reduction="channel_cosine_mean_target_tokens", real_frozen=True)
             if fake_offload_stats:
                 meta["fake_phase_offload"] = fake_offload_stats
             if offload_stats:
@@ -947,11 +1063,21 @@ def _train(config, context):
             "nonfinite_count": 0,
         }
 
-        def write_log():
-            with log_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(log, allow_nan=False) + "\n")
-
-        collective_call("write scalar diagnostics", write_log)
+        if bench is not None:
+            log["scaling_benchmark"] = {**bench, "update_seed": bench_seed,
+                "world_size": world, "comparison": "fixed per-rank work; weak scaling"}
+        diagnostics_started = time.monotonic()
+        writer.enqueue(log_path, log)
+        if bench is not None:
+            # Separate record: measures bounded CPU enqueue, not background disk completion.
+            diagnostics_finished = time.monotonic()
+            timing = {"phase": phase, **state.state_dict(),
+                "step_seconds_before_log": log["seconds"],
+                "scalar_log_enqueue_seconds": diagnostics_finished - diagnostics_started,
+                "step_through_log_seconds": diagnostics_finished - started}
+            writer.enqueue(log_path.parent / f"timing-rank-{rank:05d}.jsonl", timing)
+        if step_profiler.selected:
+            collective_call("export bounded CUDA profile", lambda: step_profiler.finish(log))
         if rank == 0:
             logger.info(
                 "Qwen %s reflow=%d fake=%d gen=%d loss=%.6g grad_norm=%.6g",
@@ -990,7 +1116,8 @@ def _train(config, context):
             )
             debug_snapshots.clear()
 
-        post_update_actions(state, phase, reflow_total, fake_total, runtime, save, run_debug)
+        if bench is None:
+            post_update_actions(state, phase, reflow_total, fake_total, runtime, save, run_debug)
     state.validate(reflow_total, fake_total)
     if (state.reflow_updates, state.fake_updates, state.generator_updates) != (
         reflow_total,
@@ -998,13 +1125,15 @@ def _train(config, context):
         fake_total // 5,
     ):
         raise RuntimeError("Training ended before all required optimizer updates")
+    collective_call("flush scalar logs before completion", writer.flush)
     collective_call(
         "record training completion",
         lambda: atomic_json(
-            output / "TRAINING_COMPLETE.json",
+            output / completion_name(bench),
             {
                 "updates": state.state_dict(),
-                "checkpoint": str(last_checkpoint or resume),
+                "checkpoint": None if bench is not None else str(last_checkpoint or resume),
+                **({"scaling_benchmark": bench} if bench is not None else {}),
                 "contract": contract,
             },
         )

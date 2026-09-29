@@ -26,7 +26,7 @@ def require_qwen_runtime():
             mismatches.append(f"{package}=={version} expected, found {actual}")
     direct = metadata.distribution("diffusers").read_text("direct_url.json")
     source = json.loads(direct or "{}")
-    if DIFFUSERS_REVISION and source.get("vcs_info", {}).get("commit_id") != DIFFUSERS_REVISION:
+    if source.get("vcs_info", {}).get("commit_id") != DIFFUSERS_REVISION:
         mismatches.append(f"diffusers commit {DIFFUSERS_REVISION} expected")
     if mismatches:
         warnings.warn("Qwen runtime pin mismatch: " + "; ".join(mismatches), RuntimeWarning)
@@ -47,8 +47,8 @@ def model_identity(root):
     if not any(k.endswith(".safetensors") for k in hashes):
         raise ValueError("No model weights found")
     return {
-        "revision": MODEL_REVISION or "unspecified",
-        "diffusers_revision": DIFFUSERS_REVISION or "unspecified",
+        "revision": MODEL_REVISION,
+        "diffusers_revision": DIFFUSERS_REVISION,
         "transformers": metadata.version("transformers"),
         "files": hashes,
     }
