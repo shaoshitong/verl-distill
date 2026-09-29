@@ -2,7 +2,7 @@
 model:
   family: qwen_image21
   pretrained_model: ${oc.env:QWEN21_MODEL_PATH}
-  revision: ${oc.env:QWEN21_MODEL_REVISION,}
+  revision: ${oc.env:QWEN21_MODEL_REVISION,b3179ad355be050328e483a9dfdd9e60cd62adfa}
 data:
   format: qwen_image21_pairs
   manifest: ${oc.env:QWEN21_TRAIN_MANIFEST}

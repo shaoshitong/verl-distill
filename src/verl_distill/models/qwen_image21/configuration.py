@@ -1,10 +1,9 @@
 """The explicit Qwen training contract; no model or accelerator imports."""
 
 import math
-import os
 
-DIFFUSERS_REVISION = os.getenv("QWEN21_DIFFUSERS_REVISION", "")
-MODEL_REVISION = os.getenv("QWEN21_MODEL_REVISION", "")
+DIFFUSERS_REVISION = "80c7ed262aeffbeb43ef13ae04baeb9b84515a69"
+MODEL_REVISION = "b3179ad355be050328e483a9dfdd9e60cd62adfa"
 CACHE_SCHEMA = 1
 
 
@@ -13,6 +12,16 @@ def validate_qwen_config(config):
     params = config["method"]["params"]
     if params.get("dmd_surrogate_dtype", "float64") not in ("float32", "float64"):
         raise ValueError("dmd_surrogate_dtype must be float32 or float64")
+    if params.get("reflow_loss", "velocity_mse") not in ("velocity_mse", "tdm_feature_cosine"):
+        raise ValueError("Unknown reflow loss")
+    if params.get("reflow_loss") == "tdm_feature_cosine":
+        if params.get("generator_input") != "rollout_dataset_noise" or params.get("score_flow_shift") != 2.0:
+            raise ValueError("Feature REFLOW requires dataset-noise rollout and score shift2")
+        if runtime.get("gradient_accumulation_steps") != 1 or runtime.get("reflow_gradient_accumulation_steps") != 1:
+            raise ValueError("Feature REFLOW recipe requires GA=1 in both phases")
+    fake_cfg = float(params.get("fake_cfg_scale", 1.0))
+    if not math.isfinite(fake_cfg) or fake_cfg != 1:
+        raise ValueError("Fake is conditional-only; remove fake_cfg_scale or set it to 1")
     teacher_cfg = float(params.get("teacher_cfg_scale", 1.0))
     if not math.isfinite(teacher_cfg) or teacher_cfg < 1:
         raise ValueError("teacher_cfg_scale must be finite and >=1")
@@ -33,13 +42,20 @@ def validate_qwen_config(config):
     for key in ("manifest", "condition_cache", "eval_manifest"):
         if not data.get(key):
             raise ValueError(f"data.{key} is required")
-    if MODEL_REVISION and model.get("revision") != MODEL_REVISION:
+    if model.get("revision") != MODEL_REVISION:
         raise ValueError("This adapter is pinned to the Qwen-Image-2.1 model revision")
-    if runtime.get("data_ordering", "random") not in ("random", "bucketed_v1"):
+    if runtime.get("data_ordering", "random") not in ("random", "bucketed_v1", "homogeneous_v2"):
         raise ValueError("Unknown data ordering")
+    if runtime.get("data_ordering") == "homogeneous_v2":
+        if not runtime.get("token_metadata_path"):
+            raise ValueError("homogeneous_v2 requires token_metadata_path")
+        for key, default in (("max_token_ratio", 1.25), ("max_resolution_ratio", 1.5)):
+            value = float(runtime.get(key, default))
+            if not math.isfinite(value) or value < 1:
+                raise ValueError(f"{key} must be finite and >=1")
     if int(runtime.get("bucket_batches", 64)) < 1:
         raise ValueError("bucket_batches must be positive")
-    if runtime.get("attention_backend", "sdpa") not in ("sdpa", "flash2_segmented"):
+    if runtime.get("attention_backend", "sdpa") not in ("sdpa", "flash2_segmented", "flash3_segmented"):
         raise ValueError("Unknown attention backend")
     migration = runtime.get("allow_infra_resume_change", False)
     if isinstance(migration, str):

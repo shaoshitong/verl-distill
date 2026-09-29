@@ -72,3 +72,13 @@ def geometry_metrics(generated, fake, real):
         "cos_DMD_HR": cosine(direction, a),
         "direction_rms": direction.square().mean().sqrt().item(),
     }
+
+
+def predict_fake_cfg(model, noisy, sigma, condition, negative_condition=None, scale=1.0):
+    """Fake is conditional-only. Legacy non-unit scale must not silently change meaning."""
+    if not math.isfinite(scale) or scale != 1:
+        raise ValueError("Fake is conditional-only; remove fake_cfg_scale or set it to 1")
+    if negative_condition is not None:
+        raise ValueError("Fake conditional-only prediction must not receive negative conditioning")
+    from .modeling import predict_velocity
+    return predict_velocity(model, noisy, sigma, condition)

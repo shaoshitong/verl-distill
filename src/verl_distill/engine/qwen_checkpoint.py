@@ -125,6 +125,29 @@ def save_checkpoint(path, models, optimizers, state, cursor, contract, config, *
     return path
 
 
+def explicit_fake200_contract_compatible(saved, current, migration):
+    """Narrow, source-pinned recipe change; never a general resume bypass."""
+    import copy
+    if not migration or set(migration) != {"kind", "source_state_sha256"}:
+        return False
+    if migration["kind"] != "fake200_conditional_fa3_homogeneous_v1":
+        return False
+    if saved["world_size"] != 32 or saved["updates"] != dict(
+        reflow_updates=300, fake_updates=200, generator_updates=40, dmd_initialized=True):
+        return False
+    old = copy.deepcopy(saved["contract"])
+    if old["params"].get("fake_cfg_scale") != 0.5 or "fake_guidance" in old:
+        return False
+    if old["runtime"].get("data_ordering") != "bucketed_v1" or old["runtime"].get("attention_backend") != "flash2_segmented":
+        return False
+    old["params"]["fake_cfg_scale"] = 1.0
+    old["fake_guidance"] = "conditional_only_single_forward_v1"
+    old["runtime"].update(data_ordering="homogeneous_v2", attention_backend="flash3_segmented",
+        max_token_ratio=1.10, max_resolution_ratio=1.5,
+        token_metadata_path=current["runtime"].get("token_metadata_path"))
+    return bool(old["runtime"]["token_metadata_path"]) and old == current
+
+
 def infrastructure_contract_compatible(saved, current):
     # Explicitly allow only the new sampler and attention implementation. Every
     # optimizer/data/model/GA/phase setting remains protected by exact equality.
@@ -303,6 +326,7 @@ def inspect_checkpoint(
     refinement=None,
     dmd_fork=False,
     allow_condition_cache_rebuild=False,
+    migration=None,
 ):
     path = Path(path)
     if not (path / "COMPLETE").is_file() or path.name.endswith(".incomplete"):
@@ -315,10 +339,15 @@ def inspect_checkpoint(
         file = within(path, relative)
         if not file.is_file() or file.stat().st_size != size:
             raise ValueError(f"Missing or truncated checkpoint file: {file}")
+    if migration and migration.get("source_state_sha256") != sha256(path / "state.json"):
+        raise ValueError("Explicit migration source state SHA mismatch")
+    if migration and not explicit_fake200_contract_compatible(saved, contract, migration):
+        raise ValueError("Unauthorized explicit Fake200 recipe difference")
     if saved["world_size"] != dist.get_world_size():
         raise ValueError("Qwen resume currently supports the same world size only")
     if (
         saved["contract"] != contract
+        and not explicit_fake200_contract_compatible(saved, contract, migration)
         and not (
             allow_infra_change and infrastructure_contract_compatible(saved["contract"], contract)
         )
@@ -338,7 +367,8 @@ def inspect_checkpoint(
 
 
 def restore_checkpoint(
-    path, models, optimizers, cursor, *, rank, reset_data_cursor=False, model_only=False
+    path, models, optimizers, cursor, *, rank, reset_data_cursor=False, model_only=False,
+    migrated_cursor=False
 ):
     for name in models:
         # The top-level sidecar is authoritative; restore RNG only after all models.
@@ -354,7 +384,7 @@ def restore_checkpoint(
             Path(path) / f"rank-{rank:05d}.pt", map_location="cpu", weights_only=False
         ),
     )
-    if not reset_data_cursor:
+    if not reset_data_cursor and not migrated_cursor:
         cursor.load_state_dict(extra["cursor"])
     # Restore once after all model/optimizer loading (which may consume RNG).
     restore_rng_state(extra["rng"])
