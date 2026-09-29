@@ -10,6 +10,10 @@ CACHE_SCHEMA = 1
 def validate_qwen_config(config):
     model, data, runtime = (config[k] for k in ("model", "data", "runtime"))
     params = config["method"]["params"]
+    if type(runtime.get("debug_force_last_exit", False)) is not bool:
+        raise ValueError("debug_force_last_exit must be boolean")
+    if runtime.get("debug_force_last_exit", False) and params.get("generator_input") != "rollout_dataset_noise":
+        raise ValueError("Forced debug exit requires dataset-noise rollout")
     if params.get("dmd_surrogate_dtype", "float64") not in ("float32", "float64"):
         raise ValueError("dmd_surrogate_dtype must be float32 or float64")
     if params.get("reflow_loss", "velocity_mse") not in ("velocity_mse", "tdm_feature_cosine"):

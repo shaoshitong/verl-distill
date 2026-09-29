@@ -1,0 +1,105 @@
+model:
+  family: qwen_image21
+  pretrained_model: /mnt/hdfs/__MERLIN_USER_DIR__/qwen21_tdm_reproduction_20260928/weights/hf
+  revision: b3179ad355be050328e483a9dfdd9e60cd62adfa
+data:
+  format: qwen_image21_pairs
+  manifest: /mnt/hdfs/__MERLIN_USER_DIR__/qwen21_tdm_reproduction_20260928/data/manifests/train.json
+  eval_manifest: /mnt/hdfs/__MERLIN_USER_DIR__/qwen21_tdm_reproduction_20260928/data/manifests/eval.json
+  condition_cache: /mnt/hdfs/__MERLIN_USER_DIR__/qwen21_tdm_reproduction_20260928/data/conditions/cache_00_positive
+  output_root: /mnt/hdfs/__MERLIN_USER_DIR__/qwen21_tdm_reproduction_20260928/data/pairs
+  reference_root: /mnt/hdfs/__MERLIN_USER_DIR__/qwen21_tdm_reproduction_20260928/data/references
+  negative_condition_cache: /mnt/hdfs/__MERLIN_USER_DIR__/qwen21_tdm_reproduction_20260928/data/conditions/cache_04_negative
+method:
+  name: dmd_full
+  params:
+    reflow_updates: 300
+    fake_updates: 3000
+    fake_updates_per_outer: 5
+    nfe: 6
+    generator_terminal: 0.4
+    sampling: uniform
+    generator_input: rollout_dataset_noise
+    fake_initialization: hf
+    guidance: conditional_only
+    score_grid_size: 1000
+    score_sigma_min: 0.02
+    score_sigma_max: 0.98
+    fake_loss: velocity_mse
+    fake_min_alpha: 0.0001
+    fake_max_weight: 50.0
+    fake_loss_weight: 1.0
+    generator_loss_weight: 1.0
+    normalization_eps: 1.0e-06
+    dmd_surrogate_dtype: float64
+    teacher_cfg_scale: 2.0
+    fake_cfg_scale: 1.0
+    score_flow_shift: 2.0
+    reflow_loss: tdm_feature_cosine
+optimizer:
+  reflow:
+    type: adamw
+    lr: 1.0e-06
+    betas:
+    - 0.9
+    - 0.999
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    lr_scheduler: none
+  generator:
+    type: adamw
+    lr: 5.0e-07
+    betas:
+    - 0.0
+    - 0.999
+    weight_decay: 0.1
+    max_grad_norm: 5.0
+    lr_scheduler: none
+  fake_score:
+    type: adamw
+    lr: 2.0e-06
+    betas:
+    - 0.9
+    - 0.95
+    weight_decay: 0.0
+    max_grad_norm: 5.0
+    lr_scheduler: none
+runtime:
+  debug_force_last_exit: true
+  output_dir: /mnt/hdfs/__MERLIN_USER_DIR__/Z_image_RL_DMD/verl-distill-runs/20260929_qwen21_dmd_restart_reflow300_singlefake_fa3_homogeneous_async_clip5
+  seed: 42
+  micro_batch_size: 1
+  reflow_gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 1
+  debug_after_reflow: false
+  reflow_checkpoint_steps:
+  - 300
+  debug_every_reflow_updates: 20
+  debug_every_fake_updates: 100
+  save_every_fake_updates: 200
+  debug_prompts_csv: /mnt/hdfs/__MERLIN_USER_DIR__/qwen21_tdm_reproduction_20260928/data/manifests/complex_prompt.csv
+  debug_prompt_count: 8
+  debug_comparison_steps: 25
+  data_ordering: homogeneous_v2
+  bucket_batches: 64
+  attention_backend: flash3_segmented
+  offload_scores_for_generator_backward: true
+  offload_inactive_for_fake: true
+  early_dmd_checkpoint_steps:
+  - 5
+  - 40
+  - 45
+  debug_reflow_steps: []
+  train_transformer_blocks_only: true
+  token_metadata_path: /opt/tiger/qwen21_fa3_bucket_20260929/token_metadata.json
+  max_token_ratio: 1.1
+  max_resolution_ratio: 1.5
+  init_reflow_from: /mnt/hdfs/__MERLIN_USER_DIR__/Z_image_RL_DMD/verl-distill-runs/20260929_qwen21_tdm_feature_reflow300_dmd3000_ga1_32gpu/checkpoints/reflow_step_000300
+distributed:
+  fsdp_backend: fsdp1
+  param_dtype: bfloat16
+  reduce_dtype: float32
+  buffer_dtype: float32
+  timeout_seconds: 7200
+ema:
+  enabled: false

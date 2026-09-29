@@ -20,20 +20,21 @@ def test_fp64_snapshot_and_statistics_preserve_small_differences(tmp_path):
     assert tensor_stats(original.float())["dtype"] == "torch.float32"
 
 
-@pytest.mark.parametrize("dtype", ["float32", "float64"])
-def test_surrogate_dtype_controls_math_without_changing_gradient_direction(dtype):
+def test_surrogate_uses_double_direction_and_official_float_loss():
+    dtype = "float64"
     h = torch.randn(2, 5, 3, requires_grad=True)
     noisy = torch.randn_like(h)
     fake = torch.randn_like(h, requires_grad=True)
     real = torch.randn_like(h, requires_grad=True)
     loss, aux = dmd_surrogate(h, noisy, fake, real, torch.tensor([.2, .8]), dtype=dtype)
-    assert loss.dtype == getattr(torch, dtype)
+    assert loss.dtype == torch.float32
     assert aux["diff_x0"].dtype == getattr(torch, dtype)
     loss.backward()
     torch.testing.assert_close(h.grad, (4 * aux["normalized_direction"] / h.numel()).float())
     assert fake.grad is None and real.grad is None
-    with pytest.raises(ValueError):
-        dmd_surrogate(h, noisy, fake, real, torch.tensor([.2, .8]), dtype="bfloat16")
+    for invalid in ("float32", "bfloat16"):
+        with pytest.raises(ValueError):
+            dmd_surrogate(h, noisy, fake, real, torch.tensor([.2, .8]), dtype=invalid)
 
 
 def test_score_bins_are_independent_of_generator_sigma_and_reduce_correctly():

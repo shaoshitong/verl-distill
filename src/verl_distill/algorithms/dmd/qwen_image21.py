@@ -96,21 +96,25 @@ def dmd_surrogate(
     normalization_eps=1e-6,
     dtype="float64",
 ):
-    if dtype not in ("float32", "float64"):
-        raise ValueError("dmd_surrogate dtype must be float32 or float64")
-    compute_dtype = getattr(torch, dtype)
+    if dtype != "float64":
+        raise ValueError("Official DMD2 parity requires float64 score reconstruction")
+    compute_dtype = torch.float64
     with torch.no_grad():
         # Promote BEFORE x0 reconstruction/subtraction. The shared x0 helper
         # explicitly uses FP32 and remains unchanged for Fake/REFLOW training.
         s = sigma.to(compute_dtype).reshape(-1, *([1] * (noisy.ndim - 1)))
         fake = noisy.to(compute_dtype) - s * fake_velocity.to(compute_dtype)
         real = noisy.to(compute_dtype) - s * real_velocity.to(compute_dtype)
-        diff = fake - real
-        denominator = (generated.detach().to(compute_dtype) - real).abs().flatten(1).mean(1)
-        denominator = denominator.clamp_min(normalization_eps)
-        direction = diff / denominator.reshape(-1, *([1] * (diff.ndim - 1)))
+        p_real = generated.detach().to(compute_dtype) - real
+        p_fake = generated.detach().to(compute_dtype) - fake
+        diff = p_real - p_fake
+        denominator = p_real.abs().flatten(1).mean(1)
+        # normalization_eps retained only for call compatibility; official has no clamp.
+        direction = torch.nan_to_num(diff / denominator.reshape(-1, *([1] * (diff.ndim - 1))))
         target = generated.detach().to(compute_dtype) - direction
-    unweighted = 0.5 * (generated.to(compute_dtype) - target).square().flatten(1).mean(1).mean()
+    unweighted = 0.5 * torch.nn.functional.mse_loss(
+        generated.float(), target.detach().float(), reduction="mean"
+    )
     loss = unweighted * loss_weight
     return loss, {
         "fake_x0": fake,

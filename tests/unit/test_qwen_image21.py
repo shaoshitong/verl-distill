@@ -84,7 +84,7 @@ def test_dmd_gradient_sign_scale_and_score_freeze(loss_weight):
     torch.testing.assert_close(aux["diff_x0"], aux["fake_x0"] - aux["real_x0"])
 
 
-def test_dmd_double_reconstruction_avoids_fp32_cancellation():
+def test_dmd_double_direction_preserved_but_official_float_target_can_round():
     generated = torch.tensor([[[1e8]]], requires_grad=True)
     loss, aux = dmd_surrogate(
         generated,
@@ -93,14 +93,15 @@ def test_dmd_double_reconstruction_avoids_fp32_cancellation():
         torch.tensor([[[1.0]]]),
         torch.ones(1),
     )
-    assert loss.dtype == torch.float64
+    assert loss.dtype == torch.float32
     for name in ("fake_x0", "real_x0", "diff_x0", "denominator", "normalized_direction"):
         assert aux[name].dtype == torch.float64
     assert aux["diff_x0"].item() == 0.5
     assert aux["denominator"].item() == 1.0
-    assert loss.item() == 0.5
+    # Official final FP32 target rounds 1e8 - 0.5 back to 1e8.
+    assert loss.item() == 0.0
     loss.backward()
-    assert generated.grad.item() == 2.0
+    assert generated.grad.item() == 0.0
 
 
 def test_schedule_count_resume_and_final_generator():

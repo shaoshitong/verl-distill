@@ -1,3 +1,5 @@
+> Superseded: the Fake200 resume described below is historical, not the current recommended run. See [the REFLOW300 restart](qwen21_reflow300_restart.md).
+
 # Qwen-Image-2.1 performance and Fake200 resume
 
 This update carries the Qwen implementation running from local snapshot `f5b7a67eb6831437269ba642ef78d57652fd0b73`. Unrelated model code is preserved from the remote main branch.

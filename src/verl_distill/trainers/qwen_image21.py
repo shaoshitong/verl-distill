@@ -361,6 +361,7 @@ def _train_with_writer(config, context, writer):
         "fsdp_use_orig_params": True,
     }
     contract["fake_guidance"] = "conditional_only_single_forward_v1"
+    contract["dmd_surrogate"] = "official_dmd2_fp64_reconstruction_nan_to_num_fp32_mse_v1"
     if teacher_cfg > 1:
         contract["teacher_guidance"] = {
             "scale": teacher_cfg,
@@ -718,10 +719,9 @@ def _train_with_writer(config, context, writer):
         optimizer = fake_optimizer if is_fake else gen_optimizer
         spec = config["optimizer"][phase]
         optimizer.zero_grad(set_to_none=True)
-        optimizer_step = state.fake_updates + 1 if is_fake else state.fake_updates
-        capture = (
-            bench is None and phase != "reflow" and optimizer_step % int(runtime["debug_every_fake_updates"]) == 0
-        )
+        from verl_distill.engine.debug_exit import capture_update, force_debug_exit
+        capture = capture_update(phase, state.fake_updates,
+            int(runtime["debug_every_fake_updates"]), benchmark=bench is not None)
         captures, micro_logs = [], []
         hit_counts = [0] * 6
         started = time.monotonic()
@@ -771,6 +771,10 @@ def _train_with_writer(config, context, writer):
             exit_draw = torch.randint(6, (1,), device=device)
             if bench is not None:
                 exit_draw.fill_(bench["exit_index"])
+            forced_debug_exit = force_debug_exit(capture,
+                runtime.get("debug_force_last_exit", False), rollout_input)
+            if forced_debug_exit:
+                exit_draw.fill_(len(levels) - 2)
             if rollout_input:
                 # FSDP all-gathers must have the same forward-call count on all ranks.
                 dist.broadcast(exit_draw, src=0)
@@ -913,6 +917,7 @@ def _train_with_writer(config, context, writer):
                 "rank": rank,
                 "ga": ga,
                 "generator_step_index": step_index,
+                "forced_debug_exit": forced_debug_exit,
                 "generator_sigma": sigma.item(),
                 "generator_sigma_grid": levels.tolist(),
                 "sample_id": row["id"],
