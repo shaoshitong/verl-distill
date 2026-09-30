@@ -10,6 +10,21 @@ CACHE_SCHEMA = 1
 def validate_qwen_config(config):
     model, data, runtime = (config[k] for k in ("model", "data", "runtime"))
     params = config["method"]["params"]
+    noise_source = params.get("rollout_initial_noise", "dataset")
+    if noise_source not in ("dataset", "gaussian"):
+        raise ValueError("rollout_initial_noise must be dataset or gaussian")
+    if noise_source == "gaussian" and params.get("generator_input") != "rollout_dataset_noise":
+        raise ValueError("Gaussian rollout noise requires the rollout generator input mode")
+    noise_migration = runtime.get("resume_initial_noise_migration")
+    if noise_migration is not None:
+        if (not isinstance(noise_migration, dict) or set(noise_migration) != {"source_state_sha256"}
+                or not isinstance(noise_migration["source_state_sha256"], str)
+                or len(noise_migration["source_state_sha256"]) != 64):
+            raise ValueError("Noise migration requires source_state_sha256")
+        if not runtime.get("resume_from") or noise_source != "gaussian":
+            raise ValueError("Noise migration requires resume_from and gaussian noise")
+        if any(runtime.get(k) for k in ("resume_dmd_fork", "resume_refinement", "resume_recipe_migration", "allow_infra_resume_change", "allow_condition_cache_rebuild")):
+            raise ValueError("Noise migration cannot be combined with other resume migrations")
     rollout_loss_mode = params.get("dmd_rollout_loss_mode", "random_exit")
     if rollout_loss_mode not in ("random_exit", "all_exits"):
         raise ValueError("dmd_rollout_loss_mode must be random_exit or all_exits")

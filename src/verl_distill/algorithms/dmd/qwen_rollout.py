@@ -37,3 +37,12 @@ def detached_rollout_step(x, levels, step_index, predict, *, train_exit):
         next_input = (exit_input + (levels[step_index + 1] - levels[step_index])
                       * velocity.float()).detach()
     return generated, exit_input, next_input
+
+
+def initial_rollout_noise(clean, dataset_noise, *, phase, rollout_input, source="dataset"):
+    """Fresh per-rank DMD rollout noise; REFLOW always retains paired data noise."""
+    if source not in ("dataset", "gaussian"):
+        raise ValueError("Unknown rollout_initial_noise")
+    if phase == "reflow" or (rollout_input and source == "dataset"):
+        return dataset_noise.to(clean.device)
+    return torch.randn_like(clean)

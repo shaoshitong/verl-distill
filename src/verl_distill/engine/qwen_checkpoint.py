@@ -318,6 +318,27 @@ def condition_cache_rebuild_contract_compatible(
     )
 
 
+def initial_noise_contract_compatible(saved, current, plan):
+    """Allow only paired->fresh rollout noise and checkpoint interval; keep Adam/RNG."""
+    import copy
+    if not plan or set(plan) != {"source_state_sha256"}:
+        return False
+    if not saved["updates"].get("dmd_initialized") or set(saved["models"]) != {"generator", "fake"}:
+        return False
+    old = copy.deepcopy(saved["contract"])
+    if old["params"].get("rollout_initial_noise", "dataset") != "dataset":
+        return False
+    if old["params"].get("generator_input") != "rollout_dataset_noise":
+        return False
+    if current["params"].get("rollout_initial_noise") != "gaussian":
+        return False
+    old["params"]["rollout_initial_noise"] = "gaussian"
+    if current["runtime"].get("save_every_fake_updates") != 100:
+        return False
+    old["runtime"]["save_every_fake_updates"] = 100
+    return old == current
+
+
 def inspect_checkpoint(
     path,
     contract,
@@ -327,6 +348,7 @@ def inspect_checkpoint(
     dmd_fork=False,
     allow_condition_cache_rebuild=False,
     migration=None,
+    initial_noise_migration=None,
 ):
     path = Path(path)
     if not (path / "COMPLETE").is_file() or path.name.endswith(".incomplete"):
@@ -343,11 +365,17 @@ def inspect_checkpoint(
         raise ValueError("Explicit migration source state SHA mismatch")
     if migration and not explicit_fake200_contract_compatible(saved, contract, migration):
         raise ValueError("Unauthorized explicit Fake200 recipe difference")
+    if initial_noise_migration:
+        if initial_noise_migration.get("source_state_sha256") != sha256(path / "state.json"):
+            raise ValueError("Noise migration source state SHA mismatch")
+        if not initial_noise_contract_compatible(saved, contract, initial_noise_migration):
+            raise ValueError("Unauthorized noise migration contract difference")
     if saved["world_size"] != dist.get_world_size():
         raise ValueError("Qwen resume currently supports the same world size only")
     if (
         saved["contract"] != contract
         and not explicit_fake200_contract_compatible(saved, contract, migration)
+        and not initial_noise_contract_compatible(saved, contract, initial_noise_migration)
         and not (
             allow_infra_change and infrastructure_contract_compatible(saved["contract"], contract)
         )

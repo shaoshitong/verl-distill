@@ -340,6 +340,7 @@ def _train_with_writer(config, context, writer):
             "resume_refinement",
             "resume_dmd_fork",
             "resume_recipe_migration",
+            "resume_initial_noise_migration",
             "allow_condition_cache_rebuild",
         )
     }
@@ -382,6 +383,7 @@ def _train_with_writer(config, context, writer):
                 resume,
                 contract,
                 migration=runtime.get("resume_recipe_migration"),
+                initial_noise_migration=runtime.get("resume_initial_noise_migration"),
                 allow_infra_change=bool(runtime.get("allow_infra_resume_change", False)),
                 refinement=runtime.get("resume_refinement"),
                 dmd_fork=bool(runtime.get("resume_dmd_fork", False)),
@@ -471,7 +473,9 @@ def _train_with_writer(config, context, writer):
                     "old_contract": saved["contract"],
                     "new_contract": contract,
                     "data_policy": (
-                        "restore model, optimizer, cursor and RNG; regenerated conditions for identical manifests"
+                        "restore G/Fake models and optimizers, cursor and RNG; fresh rollout noise and checkpoint interval only"
+                        if runtime.get("resume_initial_noise_migration")
+                        else "restore model, optimizer, cursor and RNG; regenerated conditions for identical manifests"
                         if runtime.get("allow_condition_cache_rebuild", False)
                         else "restore model, cursor and RNG; fresh DMD optimizers"
                         if runtime.get("resume_dmd_fork", False)
@@ -593,6 +597,9 @@ def _train_with_writer(config, context, writer):
                     "loaded_lrs": loaded_lrs,
                     "effective_lrs": [g["lr"] for g in gen_optimizer.param_groups],
                     "optimizer_state_entries": len(gen_optimizer.state),
+                    "fake_optimizer_state_entries": len(fake_optimizer.state) if fake_optimizer is not None else 0,
+                    "generator_adam_steps": sorted({float(v["step"].item()) if torch.is_tensor(v["step"]) else float(v["step"]) for v in gen_optimizer.state.values() if "step" in v}),
+                    "fake_adam_steps": sorted({float(v["step"].item()) if torch.is_tensor(v["step"]) else float(v["step"]) for v in fake_optimizer.state.values() if "step" in v}) if fake_optimizer is not None else [],
                     "reset_data_cursor": reset_data_cursor,
                     "updates": state.state_dict(),
                 },
@@ -784,7 +791,9 @@ def _train_with_writer(config, context, writer):
                 dist.broadcast(exit_draw, src=0)
             step_index = int(exit_draw.item())
             sigma = levels[step_index : step_index + 1]
-            noise = item["noise"].to(device) if phase == "reflow" or rollout_input else torch.randn_like(clean)
+            from verl_distill.algorithms.dmd.qwen_rollout import initial_rollout_noise
+            noise = initial_rollout_noise(clean, item["noise"], phase=phase,
+                rollout_input=rollout_input, source=params.get("rollout_initial_noise", "dataset"))
             gen_input = None if rollout_input else renoise(clean, noise, sigma)
             data_seconds = time.monotonic() - fetched
             rollout_state = noise.detach().float() if all_exits else None
@@ -983,7 +992,7 @@ def _train_with_writer(config, context, writer):
                     meta["score_offload"] = offload_stats
                 if phase != "reflow":
                     meta["generator_input_mode"] = params["generator_input"]
-                    meta["initial_noise_source"] = "dataset" if rollout_input else "fresh_gaussian"
+                    meta["initial_noise_source"] = "dataset" if rollout_input and params.get("rollout_initial_noise", "dataset") == "dataset" else "fresh_gaussian"
                     meta["generator_nfe"] = step_index + 1 if rollout_input else 1
                     meta["prefix_detached"] = rollout_input
                     meta["rollout_path"] = levels[:step_index + 1].tolist() + [0.0] if rollout_input else None
